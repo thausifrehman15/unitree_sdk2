@@ -31,6 +31,13 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${PROJECT_BINARY_DIR}/${CMAKE_INSTALL_BINDIR}
 ## Check system architecture
 message(STATUS "Current system architecture: ${CMAKE_SYSTEM_PROCESSOR}")
 
+# This is the correct and only place for find_package(OpenCV)
+find_package(OpenCV REQUIRED COMPONENTS core highgui imgcodecs dnn)
+if(NOT OpenCV_FOUND)
+    message(FATAL_ERROR "OpenCV not found. Please install OpenCV development libraries.")
+endif()
+
+
 ## Import thirdparty libraries
 add_subdirectory(thirdparty)
 
@@ -56,6 +63,7 @@ target_include_directories(unitree_sdk2 INTERFACE
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
         $<INSTALL_INTERFACE:include>)
 
+# This is the correct and only add_subdirectory for the example folder
 if (BUILD_EXAMPLES)
     add_subdirectory(example)
 endif ()
@@ -73,10 +81,11 @@ install(FILES cmake/unitree_sdk2Targets.cmake
 include(CMakePackageConfigHelpers)
 write_basic_package_version_file(
     unitree_sdk2ConfigVersion.cmake
-    VERSION "${${PROJECT_NAME}_VERSION_MAJOR}.${${PROJECT_NAME}_VERSION_MINOR}.${${PROJECT_NAME}_VERSION_PATCH}"
+    VERSION "${PROJECT_VERSION}" # Use PROJECT_VERSION set by project() command
     COMPATIBILITY ExactVersion)
 
 configure_file(cmake/unitree_sdk2Config.cmake.in unitree_sdk2Config.cmake @ONLY)
 install(FILES "${CMAKE_CURRENT_BINARY_DIR}/unitree_sdk2Config.cmake"
     "${CMAKE_CURRENT_BINARY_DIR}/unitree_sdk2ConfigVersion.cmake"
     DESTINATION lib/cmake/unitree_sdk2)
+

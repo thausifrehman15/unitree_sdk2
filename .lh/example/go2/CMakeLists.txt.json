@@ -1,0 +1,42 @@
+{
+    "sourceFile": "example/go2/CMakeLists.txt",
+    "activeCommit": 0,
+    "commits": [
+        {
+            "activePatchIndex": 6,
+            "patches": [
+                {
+                    "date": 1752584433779,
+                    "content": "Index: \n===================================================================\n--- \n+++ \n"
+                },
+                {
+                    "date": 1752584446244,
+                    "content": "Index: \n===================================================================\n--- \n+++ \n@@ -16,8 +16,8 @@\n \n add_executable(go2_video_client go2_video_client.cpp)\n target_link_libraries(go2_video_client unitree_sdk2)\n \n-add_executable(go2_vui_client go2_vui_client.cpp)\n-target_link_libraries(go2_vui_client unitree_sdk2)\n+# add_executable(go2_vui_client go2_vui_client.cpp)\n+# target_link_libraries(go2_vui_client unitree_sdk2)\n \n add_executable(hand_gesture_control example/hand_gesture_control.cpp)\n"
+                },
+                {
+                    "date": 1752584456153,
+                    "content": "Index: \n===================================================================\n--- \n+++ \n@@ -1,19 +1,19 @@\n # add_executable(go2_trajectory_follow go2_trajectory_follow.cpp)\n # target_link_libraries(go2_trajectory_follow unitree_sdk2)\n \n-add_executable(go2_sport_client go2_sport_client.cpp)\n-target_link_libraries(go2_sport_client unitree_sdk2)\n+# add_executable(go2_sport_client go2_sport_client.cpp)\n+# target_link_libraries(go2_sport_client unitree_sdk2)\n \n-add_executable(go2_low_level go2_low_level.cpp)\n-target_link_libraries(go2_low_level unitree_sdk2)\n+# add_executable(go2_low_level go2_low_level.cpp)\n+# target_link_libraries(go2_low_level unitree_sdk2)\n \n-add_executable(go2_stand_example go2_stand_example.cpp)\n-target_link_libraries(go2_stand_example unitree_sdk2)\n+# add_executable(go2_stand_example go2_stand_example.cpp)\n+# target_link_libraries(go2_stand_example unitree_sdk2)\n \n \n-add_executable(go2_robot_state_client go2_robot_state_client.cpp)\n-target_link_libraries(go2_robot_state_client unitree_sdk2)\n+# add_executable(go2_robot_state_client go2_robot_state_client.cpp)\n+# target_link_libraries(go2_robot_state_client unitree_sdk2)\n \n add_executable(go2_video_client go2_video_client.cpp)\n target_link_libraries(go2_video_client unitree_sdk2)\n \n"
+                },
+                {
+                    "date": 1752584461845,
+                    "content": "Index: \n===================================================================\n--- \n+++ \n@@ -0,0 +1,23 @@\n+# add_executable(go2_trajectory_follow go2_trajectory_follow.cpp)\n+# target_link_libraries(go2_trajectory_follow unitree_sdk2)\n+\n+add_executable(go2_sport_client go2_sport_client.cpp)\n+target_link_libraries(go2_sport_client unitree_sdk2)\n+\n+add_executable(go2_low_level go2_low_level.cpp)\n+target_link_libraries(go2_low_level unitree_sdk2)\n+\n+add_executable(go2_stand_example go2_stand_example.cpp)\n+target_link_libraries(go2_stand_example unitree_sdk2)\n+\n+\n+add_executable(go2_robot_state_client go2_robot_state_client.cpp)\n+target_link_libraries(go2_robot_state_client unitree_sdk2)\n+\n+add_executable(go2_video_client go2_video_client.cpp)\n+target_link_libraries(go2_video_client unitree_sdk2)\n+\n+add_executable(go2_vui_client go2_vui_client.cpp)\n+target_link_libraries(go2_vui_client unitree_sdk2)\n+\n+add_executable(hand_gesture_control example/hand_gesture_control.cpp)\n"
+                },
+                {
+                    "date": 1752584467695,
+                    "content": "Index: \n===================================================================\n--- \n+++ \n@@ -0,0 +1,34 @@\n+# add_executable(go2_trajectory_follow go2_trajectory_follow.cpp)\n+# target_link_libraries(go2_trajectory_follow unitree_sdk2)\n+\n+add_executable(go2_sport_client go2_sport_client.cpp)\n+target_link_libraries(go2_sport_client unitree_sdk2)\n+\n+add_executable(go2_low_level go2_low_level.cpp)\n+target_link_libraries(go2_low_level unitree_sdk2)\n+\n+add_executable(go2_stand_example go2_stand_example.cpp)\n+target_link_libraries(go2_stand_example unitree_sdk2)\n+\n+\n+add_executable(go2_robot_state_client go2_robot_state_client.cpp)\n+target_link_libraries(go2_robot_state_client unitree_sdk2)\n+\n+add_executable(go2_video_client go2_video_client.cpp)\n+target_link_libraries(go2_video_client unitree_sdk2)\n+\n+add_executable(go2_vui_client go2_vui_client.cpp)\n+target_link_libraries(go2_vui_client unitree_sdk2)\n+\n+add_executable(hand_gesture_control example/hand_gesture_control.cpp)\n+target_link_libraries(hand_gesture_control PRIVATE\n+    unitree_sdk2\n+    ${DDS_LIBS} # Assuming DDS_LIBS is defined for DDS dependencies\n+    ${OpenCV_LIBS} # Link against OpenCV libraries\n+)\n+\n+# Ensure this executable also includes necessary include directories\n+target_include_directories(hand_gesture_control PRIVATE\n+    ${CMAKE_CURRENT_SOURCE_DIR}/include\n+    ${OpenCV_INCLUDE_DIRS}\n+)\n"
+                },
+                {
+                    "date": 1752584482630,
+                    "content": "Index: \n===================================================================\n--- \n+++ \n@@ -29,5 +29,12 @@\n add_executable(hand_gesture_control example/hand_gesture_control.cpp)\n target_link_libraries(hand_gesture_control PRIVATE\n     unitree_sdk2\n     ${DDS_LIBS} # Assuming DDS_LIBS is defined for DDS dependencies\n-    ${Op\n\\ No newline at end of file\n+    ${OpenCV_LIBS} # Link against OpenCV libraries\n+)\n+\n+# Ensure this executable also includes necessary include directories\n+target_include_directories(hand_gesture_control PRIVATE\n+    ${CMAKE_CURRENT_SOURCE_DIR}/include\n+    ${OpenCV_INCLUDE_DIRS}\n+)\n"
+                },
+                {
+                    "date": 1752584776286,
+                    "content": "Index: \n===================================================================\n--- \n+++ \n@@ -0,0 +1,34 @@\n+# add_executable(go2_trajectory_follow go2_trajectory_follow.cpp)\n+# target_link_libraries(go2_trajectory_follow unitree_sdk2)\n+\n+add_executable(go2_sport_client go2_sport_client.cpp)\n+target_link_libraries(go2_sport_client unitree_sdk2)\n+\n+add_executable(go2_low_level go2_low_level.cpp)\n+target_link_libraries(go2_low_level unitree_sdk2)\n+\n+add_executable(go2_stand_example go2_stand_example.cpp)\n+target_link_libraries(go2_stand_example unitree_sdk2)\n+\n+\n+add_executable(go2_robot_state_client go2_robot_state_client.cpp)\n+target_link_libraries(go2_robot_state_client unitree_sdk2)\n+\n+add_executable(go2_video_client go2_video_client.cpp)\n+target_link_libraries(go2_video_client unitree_sdk2)\n+\n+add_executable(go2_vui_client go2_vui_client.cpp)\n+target_link_libraries(go2_vui_client unitree_sdk2)\n+\n+add_executable(hand_gesture_control example/hand_gesture_control.cpp)\n+target_link_libraries(hand_gesture_control PRIVATE\n+    unitree_sdk2\n+    ${DDS_LIBS} # Assuming DDS_LIBS is defined for DDS dependencies\n+    ${OpenCV_LIBS} # Link against OpenCV libraries\n+)\n+\n+# Ensure this executable also includes necessary include directories\n+target_include_directories(hand_gesture_control PRIVATE\n+    ${CMAKE_CURRENT_SOURCE_DIR}/include\n+    ${OpenCV_INCLUDE_DIRS}\n+)\n"
+                }
+            ],
+            "date": 1752584433779,
+            "name": "Commit-0",
+            "content": "# add_executable(go2_trajectory_follow go2_trajectory_follow.cpp)\n# target_link_libraries(go2_trajectory_follow unitree_sdk2)\n\nadd_executable(go2_sport_client go2_sport_client.cpp)\ntarget_link_libraries(go2_sport_client unitree_sdk2)\n\nadd_executable(go2_low_level go2_low_level.cpp)\ntarget_link_libraries(go2_low_level unitree_sdk2)\n\nadd_executable(go2_stand_example go2_stand_example.cpp)\ntarget_link_libraries(go2_stand_example unitree_sdk2)\n\n\nadd_executable(go2_robot_state_client go2_robot_state_client.cpp)\ntarget_link_libraries(go2_robot_state_client unitree_sdk2)\n\nadd_executable(go2_video_client go2_video_client.cpp)\ntarget_link_libraries(go2_video_client unitree_sdk2)\n\nadd_executable(go2_vui_client go2_vui_client.cpp)\ntarget_link_libraries(go2_vui_client unitree_sdk2)\n\nadd_executable(hand_gesture_control example/hand_gesture_control.cpp)\n"
+        }
+    ]
+}
