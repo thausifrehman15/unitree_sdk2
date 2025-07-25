@@ -38,3 +38,18 @@ target_include_directories(hand_gesture_control PRIVATE
     ${CMAKE_SOURCE_DIR}/thirdparty/include
     ${OpenCV_INCLUDE_DIRS}
 )
+add_executable(custom_one_leg_controller custom_one_leg_controller.cpp)
+target_link_libraries(custom_one_leg_controller PRIVATE
+    unitree_sdk2
+    ${DDS_LIBS}
+    ${OpenCV_LIBS}
+    Threads::Threads
+    ${CMAKE_SOURCE_DIR}/thirdparty/lib/${CMAKE_SYSTEM_PROCESSOR}/libddscxx.so
+    ${CMAKE_SOURCE_DIR}/thirdparty/lib/${CMAKE_SYSTEM_PROCESSOR}/libddsc.so
+)
+target_include_directories(custom_one_leg_controller PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+    ${CMAKE_SOURCE_DIR}/thirdparty/include/ddscxx
+    ${CMAKE_SOURCE_DIR}/thirdparty/include
+    ${OpenCV_INCLUDE_DIRS}
+)
