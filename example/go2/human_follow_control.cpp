@@ -1,3 +1,10 @@
+/**
+ * @file human_follow_control.cpp
+ * @brief Vision-based human following for the Unitree Go2 robot.
+ * @details This program uses YOLO for person detection and OSNet for ReID-based tracking
+ *          with gallery management for robust person re-identification across occlusions.
+ */
+
 #include <iostream>
 #include <vector>
 #include <string>
@@ -9,6 +16,12 @@
 #include <algorithm>
 #include <cmath>
 #include <signal.h>
+#include <mutex>
+#include <sstream>
+#include <map>
+#include <deque>
+#include <limits>
+#include <numeric>
 
 // Unitree SDK Headers
 #include "unitree/robot/channel/channel_publisher.hpp"
@@ -24,53 +37,44 @@
 #include <opencv2/imgcodecs/imgcodecs.hpp>
 #include <opencv2/dnn/dnn.hpp>
 
-#include <alsa/asoundlib.h>
-#include "whisper.h"  // whisper.h
+// Forward declarations
+float calculateIoU(const cv::Rect& box1, const cv::Rect& box2);
+float cosineSimilarity(const cv::Mat& a, const cv::Mat& b);
 
-// Global variable to control the main loop
+// --- Global State & Control Variables ---
 std::atomic<bool> running(true);
-// Global SportClient pointer accessible by signal handler
 unitree::robot::go2::SportClient* sport_client_ptr = nullptr;
+std::atomic<bool> is_spinning(false);
+static std::atomic<float> g_last_yaw_command{0.0f};
+static std::atomic<bool> manual_control_active(false);
 
-// --- Robot Control Constants ---
-const float MIN_FOLLOW_SPEED_X = 0.5f;
-const float MAX_FOLLOW_SPEED_X = 0.8f;
-const float TURN_SPEED_YAW = 0.8f;
+// Manual control state
+static float manual_vx = 0.0f;
+static float manual_vyaw = 0.0f;
+static bool manual_moving = false;
+
+// --- Robot Control Tuning Parameters ---
+const float MIN_FOLLOW_SPEED_X = 0.6f;
+const float MAX_FOLLOW_SPEED_X = 3.0f;
+const float TURN_SPEED_YAW = 1.0f;
+
+const float MANUAL_MOVE_SPEED = 0.5f;
+const float MANUAL_TURN_SPEED = 0.8f;
 
 const float PERSON_VERY_CLOSE_HEIGHT_RATIO = 0.95f;
 const float PERSON_CLOSE_HEIGHT_RATIO      = 0.65f;
 const float PERSON_MEDIUM_HEIGHT_RATIO     = 0.45f;
 const float PERSON_FAR_HEIGHT_RATIO        = 0.25f;
 const float PERSON_LOST_HEIGHT_RATIO       = 0.15f;
-
 const float RESUME_FOLLOW_HEIGHT_RATIO     = 0.4f;
 const float HORIZONTAL_CENTER_TOLERANCE    = 0.15f;
 
-const int FRAME_RATE = 100;
+const int FRAME_RATE = 30;
 const int SIT_ON_CLOSE_DELAY_FRAMES = 5 * FRAME_RATE;
 const int SIT_ON_STILL_DELAY_FRAMES = 3 * FRAME_RATE;
-const int LOST_PERSON_SIT_DELAY_FRAMES = 1 * FRAME_RATE;
+const int LOST_PERSON_SIT_DELAY_FRAMES = 3 * FRAME_RATE;
 const int ACTION_WAIT_MS = 1500;
 
-// Manual control constants
-const float MANUAL_MOVE_SPEED = 0.3f;
-const float MANUAL_TURN_SPEED = 0.7f;
-
-// Audio constants (voice only, no clap)
-static unsigned int AUDIO_SAMPLE_RATE = 16000;
-static unsigned int AUDIO_SAMPLE_RATE_FOR_WHISPER = 16000;
-const int AUDIO_CHANNELS = 1;
-const int AUDIO_FRAMES = 4096;
-
-std::atomic<bool> speech_command_ready(false);
-std::string last_audio_command = "";
-std::mutex command_mutex;
-std::atomic<bool> is_spinning(false);
-std::atomic<bool> push_to_talk_active(false);
-const float TURN_AROUND_SPEED = 1.0f;
-const float CONTINUOUS_SPIN_SPEED = 0.8f;
-
-// --- Robot State Enum ---
 enum RobotState {
     IDLE_STANDING,
     SITTING,
@@ -82,528 +86,501 @@ enum RobotState {
     SPINNING
 };
 
-// Voice command keywords
-const std::string WAKE_WORD = "robot";
-const std::vector<std::string> WAKE_WORD_ALIASES = {
-    "robot", "robert", "robots", "bought", "bot"
-};
-const std::vector<std::string> WAKE_WORDS = {"follow", "follow me", "come here", "start"};
-const std::vector<std::string> STOP_WORDS = {"stop", "wait", "stay", "halt"};
-const std::vector<std::string> SIT_WORDS = {"sit", "sit down", "rest", "sleep"};
-const std::vector<std::string> STAND_WORDS = {"stand", "stand up", "get up", "wake up"};
-const std::vector<std::string> TURN_AROUND_WORDS = {"turn around", "turn back", "about face", "reverse"};
-const std::vector<std::string> SPIN_WORDS = {"spin", "rotate", "keep turning", "keep spinning"};
-
-const std::vector<std::string> DAMP_WORDS = {"damp", "dampen", "relax"};
-const std::vector<std::string> BALANCE_WORDS = {"balance", "balance stand"};
-const std::vector<std::string> RECOVERY_WORDS = {"recovery", "recover", "recovery stand"};
-const std::vector<std::string> HELLO_WORDS = {"hello", "wave", "greet"};
-const std::vector<std::string> STRETCH_WORDS = {"stretch", "stretch out"};
-const std::vector<std::string> DANCE_WORDS = {"dance", "dance one", "dance two"};
-const std::vector<std::string> FLIP_WORDS = {"flip", "front flip", "back flip"};
-const std::vector<std::string> JUMP_WORDS = {"jump", "front jump"};
-
-// Audio detection class using Whisper
-class AudioDetector {
-public:
-    AudioDetector() : running(false), whisper_ctx(nullptr), capture_handle(nullptr) {
-        // Initialize Whisper model with new API
-        std::string model_path = "/home/slam22/unitree_ws/src/unitree_sdk2/assets/whisper.cpp/models/ggml-tiny.en.bin";
-
-        struct whisper_context_params cparams = whisper_context_default_params();
-        cparams.use_gpu = false;  // Set to true if you have GPU support
-
-        whisper_ctx = whisper_init_from_file_with_params(model_path.c_str(), cparams);
-
-        if (!whisper_ctx) {
-            std::cerr << "WARNING: Could not load Whisper model from " << model_path << std::endl;
-            std::cerr << "   Speech recognition disabled." << std::endl;
-            std::cerr << "   Run: cd ~/unitree_ws/src/unitree_sdk2/assets/whisper.cpp && bash ./models/download-ggml-model.sh tiny.en" << std::endl;
-        } else {
-            std::cout << "Whisper speech recognition initialized! (Model: tiny.en)" << std::endl;
-        }
-    }
-
-    ~AudioDetector() {
-        running.store(false);
-        if (whisper_ctx) whisper_free(whisper_ctx);
-    }
-
-    void start() {
-        if (running.load() || !whisper_ctx) return;
-        running.store(true);
-        audio_thread = std::thread(&AudioDetector::audioLoop, this);
-    }
-
-    void stop() {
-        if (!running.load()) return;
-
-        std::cout << "Stopping audio detector..." << std::endl;
-        running.store(false);
-
-        if (capture_handle != nullptr) {
-            std::cout << "   Closing audio device..." << std::endl;
-            snd_pcm_drop(capture_handle);
-            snd_pcm_close(capture_handle);
-            capture_handle = nullptr;
-        }
-
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
-
-        if (audio_thread.joinable()) {
-            audio_thread.detach();
-        }
-
-        std::cout << "Audio detector stopped" << std::endl;
-    }
-
-    bool isSpeechCommandReady() {
-        if (!push_to_talk_active.load()) return false;
-
-        bool result = speech_command_ready.load();
-        if (result) {
-            speech_command_ready.store(false);
-            return true;
-        }
-        return false;
-    }
-
-    std::string getLastCommand() {
-        std::lock_guard<std::mutex> lock(command_mutex);
-        std::string cmd = last_audio_command;
-        last_audio_command = "";
-        return cmd;
-    }
-
-private:
-    std::atomic<bool> running;
-    std::thread audio_thread;
-    whisper_context* whisper_ctx;
-    snd_pcm_t* capture_handle;
-
-    static constexpr int WHISPER_SAMPLE_RATE_CUSTOM = 16000;
-    static constexpr int CHUNK_DURATION_MS = 3000;
-    static constexpr int CHUNK_SAMPLES = WHISPER_SAMPLE_RATE_CUSTOM * CHUNK_DURATION_MS / 1000;
-
-    bool containsKeyword(const std::string& text, const std::vector<std::string>& keywords) {
-        std::string lower_text = text;
-        std::transform(lower_text.begin(), lower_text.end(), lower_text.begin(), ::tolower);
-
-        for (const auto& keyword : keywords) {
-            if (lower_text.find(keyword) != std::string::npos) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    bool containsWakeWordAlias(const std::string& text) {
-        std::string lower_text = text;
-        std::transform(lower_text.begin(), lower_text.end(), lower_text.begin(), ::tolower);
-
-        for (const auto& alias : WAKE_WORD_ALIASES) {
-            if (lower_text.find(alias) != std::string::npos) {
-                if (alias != "robot") {
-                    std::cout << "   Accepted alias: '" << alias << "' -> 'robot'" << std::endl;
-                }
-                return true;
-            }
-        }
-        return false;
-    }
-
-    void processCommand(const std::string& text) {
-        if (text.empty() || text.length() < 3) return;
-        if (!push_to_talk_active.load()) {
-            return;
-        }
-
-        std::cout << "Recognized: \"" << text << "\"" << std::endl;
-
-        // Check for wake word
-        if (!containsWakeWordAlias(text)) {
-            std::cout << "   No wake word detected. Ignoring." << std::endl;
-            return;
-        }
-
-        std::cout << "   Wake word detected! Processing command..." << std::endl;
-
-        std::lock_guard<std::mutex> lock(command_mutex);
-
-        // Check for commands (order matters)
-        if (containsKeyword(text, TURN_AROUND_WORDS)) {
-            last_audio_command = "turn_around";
-            speech_command_ready.store(true);
-            std::cout << "Voice Command: TURN AROUND 180" << std::endl;
-        } else if (containsKeyword(text, SPIN_WORDS)) {
-            last_audio_command = "spin";
-            speech_command_ready.store(true);
-            std::cout << "Voice Command: CONTINUOUS SPIN" << std::endl;
-        } else if (containsKeyword(text, WAKE_WORDS)) {
-            last_audio_command = "follow";
-            speech_command_ready.store(true);
-            std::cout << "Voice Command: FOLLOW ME" << std::endl;
-        } else if (containsKeyword(text, STOP_WORDS)) {
-            last_audio_command = "stop";
-            speech_command_ready.store(true);
-            std::cout << "Voice Command: STOP" << std::endl;
-        } else if (containsKeyword(text, SIT_WORDS)) {
-            last_audio_command = "sit";
-            speech_command_ready.store(true);
-            std::cout << "Voice Command: SIT DOWN" << std::endl;
-        } else if (containsKeyword(text, STAND_WORDS)) {
-            last_audio_command = "stand";
-            speech_command_ready.store(true);
-            std::cout << "Voice Command: STAND UP" << std::endl;
-        } else if (containsKeyword(text, DAMP_WORDS)) {
-            last_audio_command = "damp";
-            speech_command_ready.store(true);
-            std::cout << "Voice Command: DAMP" << std::endl;
-        } else if (containsKeyword(text, BALANCE_WORDS)) {
-            last_audio_command = "balance";
-            speech_command_ready.store(true);
-            std::cout << "Voice Command: BALANCE STAND" << std::endl;
-        } else if (containsKeyword(text, RECOVERY_WORDS)) {
-            last_audio_command = "recovery";
-            speech_command_ready.store(true);
-            std::cout << "Voice Command: RECOVERY STAND" << std::endl;
-        } else if (containsKeyword(text, HELLO_WORDS)) {
-            last_audio_command = "hello";
-            speech_command_ready.store(true);
-            std::cout << "Voice Command: HELLO" << std::endl;
-        } else if (containsKeyword(text, STRETCH_WORDS)) {
-            last_audio_command = "stretch";
-            speech_command_ready.store(true);
-            std::cout << "Voice Command: STRETCH" << std::endl;
-        } else if (containsKeyword(text, DANCE_WORDS)) {
-            last_audio_command = "dance";
-            speech_command_ready.store(true);
-            std::cout << "Voice Command: DANCE" << std::endl;
-        } else if (containsKeyword(text, FLIP_WORDS)) {
-            last_audio_command = "flip";
-            speech_command_ready.store(true);
-            std::cout << "Voice Command: FLIP" << std::endl;
-        } else if (containsKeyword(text, JUMP_WORDS)) {
-            last_audio_command = "jump";
-            speech_command_ready.store(true);
-            std::cout << "Voice Command: JUMP" << std::endl;
-        }
-    }
-
-    void audioLoop() {
-        snd_pcm_hw_params_t* hw_params;
-        int err;
-
-        capture_handle = nullptr;
-
-        if ((err = snd_pcm_open(&capture_handle, "default", SND_PCM_STREAM_CAPTURE, 0)) < 0) {
-            std::cerr << "Cannot open audio device: " << snd_strerror(err) << std::endl;
-            capture_handle = nullptr;
-            return;
-        }
-
-        snd_pcm_hw_params_malloc(&hw_params);
-        snd_pcm_hw_params_any(capture_handle, hw_params);
-        snd_pcm_hw_params_set_access(capture_handle, hw_params, SND_PCM_ACCESS_RW_INTERLEAVED);
-        snd_pcm_hw_params_set_format(capture_handle, hw_params, SND_PCM_FORMAT_S16_LE);
-
-        unsigned int sample_rate = WHISPER_SAMPLE_RATE_CUSTOM;
-        snd_pcm_hw_params_set_rate_near(capture_handle, hw_params, &sample_rate, 0);
-        snd_pcm_hw_params_set_channels(capture_handle, hw_params, 1);
-
-        if ((err = snd_pcm_hw_params(capture_handle, hw_params)) < 0) {
-            std::cerr << "Cannot set parameters: " << snd_strerror(err) << std::endl;
-            snd_pcm_close(capture_handle);
-            return;
-        }
-
-        snd_pcm_hw_params_free(hw_params);
-        snd_pcm_prepare(capture_handle);
-        snd_pcm_nonblock(capture_handle, 1);
-
-        std::vector<float> audio_buffer;
-        std::vector<int16_t> pcm_buffer(4096);
-
-        std::cout << "Whisper recognition started (rate: " << sample_rate << " Hz)" << std::endl;
-        std::cout << "Say 'robot' followed by a command (follow, stop, sit, dance, etc.)" << std::endl;
-
-        while (running.load()) {
-            err = snd_pcm_readi(capture_handle, pcm_buffer.data(), pcm_buffer.size());
-
-            if (err == -EAGAIN) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(10));
-                continue;
-            }
-
-            if (err < 0) {
-                if (err == -EPIPE) {
-                    snd_pcm_prepare(capture_handle);
-                }
-                continue;
-            }
-
-            // Convert int16 to float [-1.0, 1.0]
-            for (int i = 0; i < err; i++) {
-                audio_buffer.push_back(static_cast<float>(pcm_buffer[i]) / 32768.0f);
-            }
-
-            // Process when we have enough audio (3 seconds)
-            if (audio_buffer.size() >= CHUNK_SAMPLES) {
-                // Setup Whisper parameters
-                whisper_full_params wparams = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
-                wparams.language = "en";
-                wparams.translate = false;
-                wparams.no_timestamps = true;
-                wparams.single_segment = true;
-                wparams.print_realtime = false;
-                wparams.print_progress = false;
-                wparams.print_timestamps = false;
-                wparams.print_special = false;
-
-                // Run inference
-                if (whisper_full(whisper_ctx, wparams, audio_buffer.data(), audio_buffer.size()) == 0) {
-                    const int n_segments = whisper_full_n_segments(whisper_ctx);
-
-                    std::string full_text;
-                    for (int i = 0; i < n_segments; ++i) {
-                        const char* text = whisper_full_get_segment_text(whisper_ctx, i);
-                        full_text += text;
-                    }
-
-                    // Trim whitespace
-                    full_text.erase(0, full_text.find_first_not_of(" \t\n\r"));
-                    full_text.erase(full_text.find_last_not_of(" \t\n\r") + 1);
-
-                    if (!full_text.empty()) {
-                        processCommand(full_text);
-                    }
-                }
-
-                // Keep last 0.5 seconds for continuity
-                const int overlap_samples = WHISPER_SAMPLE_RATE_CUSTOM / 2;
-                if (audio_buffer.size() > overlap_samples) {
-                    audio_buffer.erase(audio_buffer.begin(), audio_buffer.end() - overlap_samples);
-                } else {
-                    audio_buffer.clear();
-                }
-            }
-        }
-
-        if (capture_handle != nullptr) {
-            snd_pcm_close(capture_handle);
-            capture_handle = nullptr;
-        }
-        std::cout << "Whisper recognition stopped." << std::endl;
-    }
-};
-
-// Global audio detector instance
-static std::unique_ptr<AudioDetector> audio_detector;
-
-// Signal handler to catch Ctrl+C
-void sigint_handler(int sig) {
-    std::cout << "\nCtrl+C detected. Force exit!" << std::endl;
-    _exit(0);  // Immediate exit, bypasses all cleanup
+// --- Utility Functions ---
+inline long long now_ns() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
-// --- Pose Detection Struct ---
-struct PoseDetection {
-    int class_id;
-    float confidence;
-    cv::Rect box;
-    std::vector<cv::Point2f> keypoints;
-    std::vector<float> kp_scores;
-    long long tracking_id = -1;
-};
-
-// IoU calculation
 float calculateIoU(const cv::Rect& box1, const cv::Rect& box2) {
     cv::Rect intersection = box1 & box2;
     if (intersection.empty()) return 0.0f;
     return static_cast<float>(intersection.area()) / (box1.area() + box2.area() - intersection.area());
 }
 
-// YOLO-Pose Detector Class
-class YoloPoseDetector {
+float cosineSimilarity(const cv::Mat& a, const cv::Mat& b) {
+    if (a.empty() || b.empty() || a.type() != CV_32F || b.type() != CV_32F) return 0.0f;
+    return a.dot(b); // Already L2 normalized
+}
+
+// --- Kalman Filter for Motion Prediction ---
+class KalmanTracker {
 public:
-    YoloPoseDetector(const std::string& model_path, const std::string& class_names_path) {
-        net = cv::dnn::readNetFromONNX(model_path);
-        if (net.empty()) {
-            std::cerr << "ERROR: Could not load YOLO-Pose model from " << model_path << std::endl;
-            exit(1);
-        }
-        net.setPreferableBackend(cv::dnn::DNN_BACKEND_OPENCV);
-        net.setPreferableTarget(cv::dnn::DNN_TARGET_CPU);
+    KalmanTracker(const cv::Rect& initial_bbox) {
+        kf = cv::KalmanFilter(8, 4, 0);
+        kf.transitionMatrix = cv::Mat::eye(8, 8, CV_32F);
+        kf.transitionMatrix.at<float>(0, 4) = 1;
+        kf.transitionMatrix.at<float>(1, 5) = 1;
+        kf.transitionMatrix.at<float>(2, 6) = 1;
+        kf.transitionMatrix.at<float>(3, 7) = 1;
 
-        std::ifstream ifs(class_names_path);
-        if (!ifs.is_open()) {
-            std::cerr << "ERROR: Could not open class names file: " << class_names_path << std::endl;
-            exit(1);
-        }
-        std::string line;
-        while (std::getline(ifs, line)) {
-            class_names.push_back(line);
-        }
-        std::cout << "YOLO-Pose model loaded from: " << model_path << std::endl;
-        std::cout << "Loaded " << class_names.size() << " class names." << std::endl;
+        cv::setIdentity(kf.measurementMatrix);
+        cv::setIdentity(kf.processNoiseCov, cv::Scalar::all(1e-2));
+        cv::setIdentity(kf.measurementNoiseCov, cv::Scalar::all(1e-1));
+        cv::setIdentity(kf.errorCovPost, cv::Scalar::all(1));
+
+        kf.statePost.at<float>(0) = initial_bbox.x + initial_bbox.width / 2.0f;
+        kf.statePost.at<float>(1) = initial_bbox.y + initial_bbox.height / 2.0f;
+        kf.statePost.at<float>(2) = initial_bbox.width;
+        kf.statePost.at<float>(3) = initial_bbox.height;
     }
 
-    std::vector<PoseDetection> detect(const cv::Mat& frame) {
-        std::vector<PoseDetection> detections;
-        if (frame.empty()) return detections;
-
-        cv::Mat blob;
-        cv::dnn::blobFromImage(frame, blob, 1/255.0, cv::Size(INPUT_WIDTH, INPUT_HEIGHT), cv::Scalar(), true, false);
-        net.setInput(blob);
-
-        std::vector<cv::Mat> outputs;
-        net.forward(outputs, net.getUnconnectedOutLayersNames());
-
-        cv::Mat output_data = outputs[0].reshape(1, outputs[0].size[1]);
-        output_data = output_data.t();
-
-        const int num_rows = output_data.rows;
-        const int num_cols = output_data.cols;
-        const int expected_min_cols = 5 + NUM_KEYPOINTS * 3;
-        if(num_cols != expected_min_cols) return detections;
-
-        std::vector<cv::Rect> boxes;
-        std::vector<float> confidences;
-        std::vector<int> class_ids;
-        std::vector<std::vector<cv::Point2f>> all_keypoints;
-        std::vector<std::vector<float>> all_kp_scores;
-
-        for(int i = 0; i < num_rows; ++i) {
-            float* data = (float*)output_data.row(i).data;
-            float confidence = data[4];
-
-            if(confidence >= CONFIDENCE_THRESHOLD && confidence > SCORE_THRESHOLD) {
-                float x_center = data[0];
-                float y_center = data[1];
-                float box_width = data[2];
-                float box_height = data[3];
-
-                int x = static_cast<int>((x_center - 0.5 * box_width) * frame.cols / INPUT_WIDTH);
-                int y = static_cast<int>((y_center - 0.5 * box_height) * frame.rows / INPUT_HEIGHT);
-                int width = static_cast<int>(box_width * frame.cols / INPUT_WIDTH);
-                int height = static_cast<int>(box_height * frame.rows / INPUT_HEIGHT);
-
-                boxes.push_back(cv::Rect(x,y,width,height));
-                confidences.push_back(confidence);
-                class_ids.push_back(0);
-
-                std::vector<cv::Point2f> current_keypoints;
-                std::vector<float> current_kp_scores;
-                for(int k=0; k<NUM_KEYPOINTS; ++k) {
-                    int kp_offset = 5 + k*3;
-                    if(kp_offset + 2 < num_cols) {
-                        float kp_x = data[kp_offset];
-                        float kp_y = data[kp_offset+1];
-                        float kp_score = data[kp_offset+2];
-                        current_keypoints.push_back(cv::Point2f(kp_x * frame.cols / INPUT_WIDTH, kp_y * frame.rows / INPUT_HEIGHT));
-                        current_kp_scores.push_back(kp_score);
-                    } else {
-                        current_keypoints.push_back(cv::Point2f(0,0));
-                        current_kp_scores.push_back(0.f);
-                    }
-                }
-                all_keypoints.push_back(current_keypoints);
-                all_kp_scores.push_back(current_kp_scores);
-            }
-        }
-
-        std::vector<int> indices;
-        cv::dnn::NMSBoxes(boxes, confidences, SCORE_THRESHOLD, NMS_THRESHOLD, indices);
-
-        for(int idx : indices) {
-            detections.push_back({class_ids[idx], confidences[idx], boxes[idx], all_keypoints[idx], all_kp_scores[idx]});
-        }
-        return detections;
+    cv::Rect predict() {
+        cv::Mat prediction = kf.predict();
+        float cx = prediction.at<float>(0);
+        float cy = prediction.at<float>(1);
+        float w = std::max(1.0f, prediction.at<float>(2));
+        float h = std::max(1.0f, prediction.at<float>(3));
+        return cv::Rect(static_cast<int>(cx - w/2), static_cast<int>(cy - h/2), 
+                       static_cast<int>(w), static_cast<int>(h));
     }
 
-    const std::vector<std::string>& getClassNames() const {
-        return class_names;
+    void update(const cv::Rect& bbox) {
+        cv::Mat measurement(4, 1, CV_32F);
+        measurement.at<float>(0) = bbox.x + bbox.width / 2.0f;
+        measurement.at<float>(1) = bbox.y + bbox.height / 2.0f;
+        measurement.at<float>(2) = bbox.width;
+        measurement.at<float>(3) = bbox.height;
+        kf.correct(measurement);
     }
 
 private:
-    cv::dnn::Net net;
-    std::vector<std::string> class_names;
-
-    static constexpr int INPUT_WIDTH = 640;
-    static constexpr int INPUT_HEIGHT = 640;
-    static constexpr float CONFIDENCE_THRESHOLD = 0.7f;
-    static constexpr float SCORE_THRESHOLD = 0.6f;
-    static constexpr float NMS_THRESHOLD = 0.45f;
-    static constexpr int NUM_KEYPOINTS = 17;
+    cv::KalmanFilter kf;
 };
 
-// Global static vars for tracking
+// --- OSNet ReID Feature Extractor ---
+class ReIDExtractor {
+public:
+    ReIDExtractor(const std::string& model_path) {
+        net = cv::dnn::readNetFromONNX(model_path);
+        if (net.empty()) {
+            std::cerr << "ERROR: Could not load OSNet model from " << model_path << std::endl;
+            std::cerr << "Using fallback color histogram features." << std::endl;
+            use_osnet = false;
+        } else {
+            net.setPreferableBackend(cv::dnn::DNN_BACKEND_OPENCV);
+            net.setPreferableTarget(cv::dnn::DNN_TARGET_CPU);
+            use_osnet = true;
+            std::cout << "OSNet ReID model loaded successfully." << std::endl;
+        }
+    }
+    
+    cv::Mat extract(const cv::Mat& frame, const cv::Rect& bbox) {
+        cv::Rect safe_box = bbox & cv::Rect(0, 0, frame.cols, frame.rows);
+        if (safe_box.area() == 0) return cv::Mat();
+        
+        cv::Mat roi = frame(safe_box);
+        
+        if (use_osnet) {
+            cv::Mat resized;
+            cv::resize(roi, resized, cv::Size(128, 256));
+            
+            cv::Mat blob;
+            cv::dnn::blobFromImage(resized, blob, 1.0/255.0, cv::Size(128, 256), 
+                                   cv::Scalar(0.485, 0.456, 0.406), true, false);
+            
+            net.setInput(blob);
+            cv::Mat embedding = net.forward();
+            cv::Mat normalized;
+            cv::normalize(embedding, normalized, 1.0, 0.0, cv::NORM_L2);
+            return normalized.reshape(1, 1);
+        } else {
+            return extractColorHistogram(roi);
+        }
+    }
+    
+private:
+    cv::dnn::Net net;
+    bool use_osnet;
+    
+    cv::Mat extractColorHistogram(const cv::Mat& roi) {
+        cv::Mat hsv;
+        cv::cvtColor(roi, hsv, cv::COLOR_BGR2HSV);
+        int h_bins = 30, s_bins = 32;
+        int histSize[] = {h_bins, s_bins};
+        float h_ranges[] = {0, 180};
+        float s_ranges[] = {0, 256};
+        const float* ranges[] = {h_ranges, s_ranges};
+        int channels[] = {0, 1};
+        cv::Mat hist;
+        cv::calcHist(&hsv, 1, channels, cv::Mat(), hist, 2, histSize, ranges, true, false);
+        cv::normalize(hist, hist, 1.0, 0.0, cv::NORM_L2);
+        return hist.reshape(1, 1);
+    }
+};
+
+// --- Track with Embedding Gallery ---
+struct Track {
+    long long id;
+    cv::Rect bbox;
+    KalmanTracker kf;
+    std::deque<cv::Mat> embedding_gallery;
+    int hits;
+    int age;
+    int time_since_update;
+    float score;
+    
+    static const int MAX_GALLERY_SIZE = 10;
+    static const int MIN_HITS_FOR_CONFIRMATION = 3;
+
+    Track(long long track_id, const cv::Rect& initial_bbox, const cv::Mat& embedding, float det_score)
+        : id(track_id), bbox(initial_bbox), kf(initial_bbox),
+          hits(1), age(1), time_since_update(0), score(det_score) {
+        if (!embedding.empty()) {
+            embedding_gallery.push_back(embedding.clone());
+        }
+    }
+
+    void predict() {
+        bbox = kf.predict();
+        age++;
+        time_since_update++;
+    }
+
+    void update(const cv::Rect& new_bbox, const cv::Mat& new_embedding, float det_score) {
+        kf.update(new_bbox);
+        bbox = new_bbox;
+        score = det_score;
+        hits++;
+        time_since_update = 0;
+        
+        if (!new_embedding.empty()) {
+            embedding_gallery.push_back(new_embedding.clone());
+            if (embedding_gallery.size() > MAX_GALLERY_SIZE) {
+                embedding_gallery.pop_front();
+            }
+        }
+    }
+    
+    float matchScore(const cv::Mat& query_embedding) const {
+        if (query_embedding.empty() || embedding_gallery.empty()) return 0.0f;
+        
+        float max_sim = 0.0f;
+        for (const auto& stored_emb : embedding_gallery) {
+            float sim = cosineSimilarity(stored_emb, query_embedding);
+            max_sim = std::max(max_sim, sim);
+        }
+        return max_sim;
+    }
+    
+    bool isConfirmed() const { return hits >= MIN_HITS_FOR_CONFIRMATION; }
+};
+
+// --- Advanced ReID-based Tracker with Matching Cascade ---
+class ReIDTracker {
+public:
+    ReIDTracker() : next_id(1), max_time_lost(30), locked_track_id(-1) {}
+    
+    void setLockedTrackId(long long locked_id) { locked_track_id = locked_id; }
+    
+    std::vector<Track>& update(const std::vector<cv::Rect>& detections, 
+                               const std::vector<cv::Mat>& embeddings,
+                               const std::vector<float>& scores) {
+        // Stage 1: Predict all tracks
+        for (auto& track : tracks) {
+            track.predict();
+        }
+        
+        // Stage 2: Separate tracks into confirmed, tentative, and lost
+        std::vector<int> confirmed_idx, tentative_idx, lost_idx;
+        for (size_t i = 0; i < tracks.size(); i++) {
+            if (tracks[i].time_since_update == 0 && tracks[i].isConfirmed()) {
+                confirmed_idx.push_back(i);
+            } else if (tracks[i].time_since_update == 0 && !tracks[i].isConfirmed()) {
+                tentative_idx.push_back(i);
+            } else if (tracks[i].time_since_update > 0) {
+                lost_idx.push_back(i);
+            }
+        }
+        
+        std::vector<bool> det_matched(detections.size(), false);
+        std::vector<bool> track_matched(tracks.size(), false);
+        
+        // Stage 3: Matching Cascade - Level 1 (Confirmed tracks: IoU + Appearance)
+        if (!confirmed_idx.empty() && !detections.empty()) {
+            matchTracks(confirmed_idx, detections, embeddings, scores, 
+                       det_matched, track_matched, 0.3f, 0.5f, 0.6f);
+        }
+        
+        // Stage 4: Matching Cascade - Level 2 (Tentative tracks: IoU only)
+        if (!tentative_idx.empty() && !detections.empty()) {
+            matchTracks(tentative_idx, detections, embeddings, scores,
+                       det_matched, track_matched, 0.4f, 0.0f, 0.5f);
+        }
+        
+        // Stage 5: Matching Cascade - Level 3 (Lost tracks: Appearance only)
+        if (!lost_idx.empty() && !detections.empty()) {
+            matchTracksAppearanceOnly(lost_idx, detections, embeddings, scores,
+                                     det_matched, track_matched, 0.6f);
+        }
+        
+        // Stage 6: Create new tracks for unmatched detections
+        for (size_t i = 0; i < detections.size(); i++) {
+            if (!det_matched[i]) {
+                bool overlaps = false;
+                for (const auto& track : tracks) {
+                    if (calculateIoU(track.bbox, detections[i]) > 0.3f) {
+                        overlaps = true;
+                        break;
+                    }
+                }
+                if (!overlaps) {
+                    cv::Mat emb = (i < embeddings.size()) ? embeddings[i] : cv::Mat();
+                    float scr = (i < scores.size()) ? scores[i] : 0.5f;
+                    tracks.emplace_back(next_id++, detections[i], emb, scr);
+                }
+            }
+        }
+        
+        // Stage 7: Remove dead tracks
+        int effective_max_time_lost = max_time_lost;
+        for (auto& track : tracks) {
+            if (locked_track_id != -1 && track.id == locked_track_id) {
+                effective_max_time_lost = 150; // 5 seconds @ 30fps
+                if (track.time_since_update > effective_max_time_lost) {
+                    std::cout << "Locked person (ID: " << locked_track_id << ") lost. Clearing." << std::endl;
+                    locked_track_id = -1;
+                }
+                break;
+            }
+        }
+        
+        tracks.erase(
+            std::remove_if(tracks.begin(), tracks.end(),
+                [this, effective_max_time_lost](const Track& t) {
+                    bool is_locked = (locked_track_id != -1 && t.id == locked_track_id);
+                    int age_threshold = is_locked ? effective_max_time_lost : max_time_lost;
+                    return t.time_since_update > age_threshold;
+                }),
+            tracks.end()
+        );
+        
+        return tracks;
+    }
+    
+    std::vector<Track>& getTracks() { return tracks; }
+    
+    Track* findTrackById(long long id) {
+        for (auto& track : tracks) {
+            if (track.id == id) return &track;
+        }
+        return nullptr;
+    }
+
+private:
+    void matchTracks(const std::vector<int>& track_indices,
+                    const std::vector<cv::Rect>& detections,
+                    const std::vector<cv::Mat>& embeddings,
+                    const std::vector<float>& scores,
+                    std::vector<bool>& det_matched,
+                    std::vector<bool>& track_matched,
+                    float iou_weight,
+                    float app_weight,
+                    float threshold) {
+        
+        std::vector<std::vector<float>> cost_matrix(track_indices.size(), 
+                                                    std::vector<float>(detections.size(), 1.0f));
+        
+        for (size_t i = 0; i < track_indices.size(); i++) {
+            int track_idx = track_indices[i];
+            bool is_locked = (locked_track_id != -1 && tracks[track_idx].id == locked_track_id);
+            
+            for (size_t j = 0; j < detections.size(); j++) {
+                if (det_matched[j]) continue;
+                
+                float iou = calculateIoU(tracks[track_idx].bbox, detections[j]);
+                float app_sim = 0.0f;
+                
+                if (j < embeddings.size() && !embeddings[j].empty()) {
+                    app_sim = tracks[track_idx].matchScore(embeddings[j]);
+                }
+                
+                // For locked track, prioritize IoU to prevent switching
+                if (is_locked) {
+                    cost_matrix[i][j] = 1.0f - (0.8f * iou + 0.2f * app_sim);
+                } else {
+                    cost_matrix[i][j] = 1.0f - (iou_weight * iou + app_weight * app_sim);
+                }
+            }
+        }
+        
+        auto matches = greedyAssignment(cost_matrix, threshold);
+        
+        for (const auto& match : matches) {
+            int track_idx = track_indices[match.first];
+            int det_idx = match.second;
+            
+            cv::Mat emb = (det_idx < embeddings.size()) ? embeddings[det_idx] : cv::Mat();
+            float scr = (det_idx < scores.size()) ? scores[det_idx] : 0.5f;
+            
+            tracks[track_idx].update(detections[det_idx], emb, scr);
+            track_matched[track_idx] = true;
+            det_matched[det_idx] = true;
+        }
+    }
+    
+    void matchTracksAppearanceOnly(const std::vector<int>& track_indices,
+                                   const std::vector<cv::Rect>& detections,
+                                   const std::vector<cv::Mat>& embeddings,
+                                   const std::vector<float>& scores,
+                                   std::vector<bool>& det_matched,
+                                   std::vector<bool>& track_matched,
+                                   float threshold) {
+        
+        std::vector<std::vector<float>> cost_matrix(track_indices.size(), 
+                                                    std::vector<float>(detections.size(), 1.0f));
+        
+        for (size_t i = 0; i < track_indices.size(); i++) {
+            int track_idx = track_indices[i];
+            for (size_t j = 0; j < detections.size(); j++) {
+                if (det_matched[j]) continue;
+                
+                if (j < embeddings.size() && !embeddings[j].empty()) {
+                    float app_sim = tracks[track_idx].matchScore(embeddings[j]);
+                    cost_matrix[i][j] = 1.0f - app_sim;
+                }
+            }
+        }
+        
+        auto matches = greedyAssignment(cost_matrix, threshold);
+        
+        for (const auto& match : matches) {
+            int track_idx = track_indices[match.first];
+            int det_idx = match.second;
+            
+            cv::Mat emb = (det_idx < embeddings.size()) ? embeddings[det_idx] : cv::Mat();
+            float scr = (det_idx < scores.size()) ? scores[det_idx] : 0.5f;
+            
+            tracks[track_idx].update(detections[det_idx], emb, scr);
+            track_matched[track_idx] = true;
+            det_matched[det_idx] = true;
+        }
+    }
+    
+    std::vector<std::pair<int, int>> greedyAssignment(const std::vector<std::vector<float>>& cost_matrix, 
+                                                     float thresh) {
+        if (cost_matrix.empty()) return {};
+        
+        int rows = cost_matrix.size();
+        int cols = cost_matrix[0].size();
+        
+        std::vector<std::pair<int, int>> matches;
+        std::vector<bool> row_matched(rows, false);
+        std::vector<bool> col_matched(cols, false);
+        
+        for (int iter = 0; iter < std::min(rows, cols); iter++) {
+            float min_cost = 1e9f;
+            int min_i = -1, min_j = -1;
+            
+            for (int i = 0; i < rows; i++) {
+                if (row_matched[i]) continue;
+                for (int j = 0; j < cols; j++) {
+                    if (col_matched[j]) continue;
+                    if (cost_matrix[i][j] < min_cost) {
+                        min_cost = cost_matrix[i][j];
+                        min_i = i;
+                        min_j = j;
+                    }
+                }
+            }
+            
+            if (min_cost < thresh && min_i >= 0 && min_j >= 0) {
+                matches.push_back({min_i, min_j});
+                row_matched[min_i] = true;
+                col_matched[min_j] = true;
+            } else {
+                break;
+            }
+        }
+        
+        return matches;
+    }
+    
+    std::vector<Track> tracks;
+    long long next_id;
+    int max_time_lost;
+    long long locked_track_id;
+};
+
+// --- Performance Metrics ---
+struct PerformanceMetrics {
+    long long start_time_ns = 0;
+    long long total_frames = 0;
+    long long frames_with_track = 0;
+    long long cumulative_yolo_ns = 0;
+    long long cumulative_reid_ns = 0;
+    long long cumulative_tracker_ns = 0;
+    long long yolo_samples = 0;
+    long long reid_samples = 0;
+    long long tracker_samples = 0;
+};
+
+static PerformanceMetrics g_metrics;
+static std::mutex g_metrics_mutex;
+
+static void metrics_record_yolo(long long ns) {
+    std::lock_guard<std::mutex> lk(g_metrics_mutex);
+    g_metrics.cumulative_yolo_ns += ns;
+    g_metrics.yolo_samples++;
+}
+
+static void metrics_record_reid(long long ns) {
+    std::lock_guard<std::mutex> lk(g_metrics_mutex);
+    g_metrics.cumulative_reid_ns += ns;
+    g_metrics.reid_samples++;
+}
+
+static void metrics_record_tracker(long long ns) {
+    std::lock_guard<std::mutex> lk(g_metrics_mutex);
+    g_metrics.cumulative_tracker_ns += ns;
+    g_metrics.tracker_samples++;
+}
+
+static void metrics_finalize() {
+    std::lock_guard<std::mutex> lk(g_metrics_mutex);
+    long long runtime_ns = now_ns() - g_metrics.start_time_ns;
+    double runtime_s = runtime_ns / 1e9;
+    
+    std::cout << "\n========== PERFORMANCE REPORT ==========\n";
+    std::cout << "Runtime: " << runtime_s << " s\n";
+    std::cout << "Total Frames: " << g_metrics.total_frames << "\n";
+    std::cout << "FPS: " << (g_metrics.total_frames / runtime_s) << "\n";
+    
+    if (g_metrics.yolo_samples > 0) {
+        std::cout << "Avg YOLO: " << (g_metrics.cumulative_yolo_ns / g_metrics.yolo_samples / 1e6) << " ms\n";
+    }
+    if (g_metrics.reid_samples > 0) {
+        std::cout << "Avg ReID: " << (g_metrics.cumulative_reid_ns / g_metrics.reid_samples / 1e6) << " ms\n";
+    }
+    if (g_metrics.tracker_samples > 0) {
+        std::cout << "Avg Tracker: " << (g_metrics.cumulative_tracker_ns / g_metrics.tracker_samples / 1e6) << " ms\n";
+    }
+    std::cout << "========================================\n";
+}
+
+// --- Global Tracker Instance ---
+static ReIDTracker reid_tracker;
+static long long locked_person_id = -1;
 static long long tracked_person_id_global = -1;
 static std::string current_robot_state_string_global = "IDLE_STANDING";
 static std::string current_person_follow_status_global = "Not Detected";
-
 static std::atomic<bool> is_action_in_progress(false);
 static std::atomic<RobotState> current_robot_physical_state(IDLE_STANDING);
+static bool preserve_tracking_after_sit = false;
+static bool waiting_for_trigger = false;  // New: Waiting for person to trigger stand-up
 
-// Convert enum to string
+// --- Robot Actions ---
 std::string robotStateToString(RobotState state) {
     switch(state) {
         case IDLE_STANDING: return "IDLE_STANDING";
         case SITTING: return "SITTING";
-        case STANDING_UP_IN_PROGRESS: return "STANDING_UP_IN_PROGRESS";
-        case SITTING_DOWN_IN_PROGRESS: return "SITTING_DOWN_IN_PROGRESS";
+        case STANDING_UP_IN_PROGRESS: return "STANDING_UP";
+        case SITTING_DOWN_IN_PROGRESS: return "SITTING_DOWN";
         case FOLLOWING: return "FOLLOWING";
-        case STOPPING_FOR_STILL_PERSON: return "STOPPING_FOR_STILL_PERSON";
-        case LOST_PERSON_IDLE: return "LOST_PERSON_IDLE";
+        case STOPPING_FOR_STILL_PERSON: return "STOPPED";
+        case LOST_PERSON_IDLE: return "LOST";
         case SPINNING: return "SPINNING";
         default: return "UNKNOWN";
-    }
-}
-
-void performTurnAround180(unitree::robot::go2::SportClient& client) {
-    if (is_action_in_progress.load()) return;
-    is_action_in_progress.store(true);
-    std::cout << "Executing 180-degree turn..." << std::endl;
-
-    std::thread([&]() {
-        const int TURN_DURATION_MS = 3200;
-        auto start_time = std::chrono::steady_clock::now();
-        while (std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now() - start_time).count() < TURN_DURATION_MS) {
-            client.Move(0.0f, 0.0f, TURN_AROUND_SPEED);
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        }
-        client.Move(0.0f, 0.0f, 0.0f);
-        is_action_in_progress.store(false);
-        std::cout << "180-degree turn completed!" << std::endl;
-    }).detach();
-}
-
-void startContinuousSpin(unitree::robot::go2::SportClient& client) {
-    if (is_spinning.load()) {
-        std::cout << "Already spinning!" << std::endl;
-        return;
-    }
-
-    is_spinning.store(true);
-    current_robot_physical_state.store(SPINNING);
-    std::cout << "Starting continuous spin... Say 'stop' to halt." << std::endl;
-
-    std::thread([&]() {
-        while (is_spinning.load() && running.load()) {
-            client.Move(0.0f, 0.0f, CONTINUOUS_SPIN_SPEED);
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        }
-        client.Move(0.0f, 0.0f, 0.0f);
-        current_robot_physical_state.store(IDLE_STANDING);
-        std::cout << "Continuous spin stopped." << std::endl;
-    }).detach();
-}
-
-void stopContinuousSpin(unitree::robot::go2::SportClient& client) {
-    if (is_spinning.load()) {
-        std::cout << "Stopping continuous spin..." << std::endl;
-        is_spinning.store(false);
     }
 }
 
@@ -611,524 +588,577 @@ void performStandUp(unitree::robot::go2::SportClient& client) {
     if (is_action_in_progress.load()) return;
     is_action_in_progress.store(true);
     current_robot_physical_state.store(STANDING_UP_IN_PROGRESS);
-    std::cout << "Robot executing StandUp()..." << std::endl;
+    std::cout << "Standing up..." << std::endl;
     client.StandUp();
     std::thread([&]() {
         std::this_thread::sleep_for(std::chrono::milliseconds(ACTION_WAIT_MS));
         is_action_in_progress.store(false);
         current_robot_physical_state.store(IDLE_STANDING);
-        std::cout << "StandUp() completed. Robot now IDLE_STANDING." << std::endl;
+        std::cout << "StandUp complete." << std::endl;
     }).detach();
 }
 
-void performSit(unitree::robot::go2::SportClient& client) {
+void performSit(unitree::robot::go2::SportClient& client, bool preserve = false) {
     if (is_action_in_progress.load()) return;
     is_action_in_progress.store(true);
     current_robot_physical_state.store(SITTING_DOWN_IN_PROGRESS);
-    std::cout << "Robot executing Sit()..." << std::endl;
+    preserve_tracking_after_sit = preserve;
+    if (!preserve) {
+        tracked_person_id_global = -1;
+        locked_person_id = -1;
+    }
+    std::cout << "Sitting down..." << std::endl;
     client.Sit();
     std::thread([&]() {
         std::this_thread::sleep_for(std::chrono::milliseconds(ACTION_WAIT_MS));
         is_action_in_progress.store(false);
         current_robot_physical_state.store(SITTING);
-        std::cout << "Sit() completed. Robot now SITTING." << std::endl;
+        std::cout << "Sit complete." << std::endl;
     }).detach();
 }
 
-// Robot command logic
-void sendRobotCommand(unitree::robot::go2::SportClient& client, std::vector<PoseDetection>& detections, int image_width, int image_height) {
-    static long long tracked_person_id = -1;
-    static cv::Rect last_tracked_person_box;
-    static cv::Point2f last_person_center_check = cv::Point2f(-1,-1);
-    static float last_person_area_check = -1.f;
+// --- Robot Command Logic ---
+void sendRobotCommand(unitree::robot::go2::SportClient& client, int image_width, int image_height) {
     static int frames_person_standing_still = 0;
     static int frames_person_too_close = 0;
-    static int frames_person_lost = 0;
-
-    PoseDetection* current_tracked_person_det = nullptr;
+    static int frames_locked_person_missing = 0;
+    static int search_rotation_frames = 0;
+    static long long last_command_time = 0;
+    static float last_known_person_center_x = 0.5f;  // Track last position
+    
+    // Manual control overrides automatic following
+    if (manual_control_active.load()) {
+        // Send manual control commands continuously
+        long long now = now_ns();
+        if (manual_moving && (now - last_command_time > 30000000)) {
+            client.Move(manual_vx, 0, manual_vyaw);
+            last_command_time = now;
+        }
+        return;
+    }
+    
+    Track* current_tracked_person = nullptr;
     current_robot_state_string_global = robotStateToString(current_robot_physical_state.load());
 
-    if (audio_detector && audio_detector->isSpeechCommandReady()) {
-        std::string voice_cmd = audio_detector->getLastCommand();
-        RobotState current_state = current_robot_physical_state.load();
-
-        std::cout << "Executing voice command: '" << voice_cmd << "'" << std::endl;
-
-        if (voice_cmd == "sit") {
-            if (current_state != SITTING && current_state != SITTING_DOWN_IN_PROGRESS) {
-                std::cout << "Sitting down on voice command..." << std::endl;
-                performSit(client);
-            } else {
-                std::cout << "Robot is already sitting." << std::endl;
-            }
-            return;
-        }
-
-        else if (voice_cmd == "stand") {
-            if (current_state == SITTING || current_state == SITTING_DOWN_IN_PROGRESS) {
-                std::cout << "Standing up on voice command..." << std::endl;
-                performStandUp(client);
-            } else {
-                std::cout << "Robot already standing/active." << std::endl;
-            }
-            return;
-        }
-
-        else if (voice_cmd == "turn_around") {
-            if (current_state != SITTING && !is_spinning.load()) {
-                performTurnAround180(client);
-            }
-            return;
-        }
-        else if (voice_cmd == "spin") {
-            if (current_state != SITTING && !is_spinning.load()) {
-                startContinuousSpin(client);
-            }
-            return;
-        }
-        else if (voice_cmd == "damp" || voice_cmd == "balance" || voice_cmd == "recovery" ||
-                 voice_cmd == "hello" || voice_cmd == "stretch" || voice_cmd == "dance" ||
-                 voice_cmd == "flip" || voice_cmd == "jump") {
-            if (voice_cmd == "damp") client.Damp();
-            else if (voice_cmd == "balance") client.BalanceStand();
-            else if (voice_cmd == "recovery") client.RecoveryStand();
-            else if (voice_cmd == "hello") client.Hello();
-            else if (voice_cmd == "stretch") client.Stretch();
-            else if (voice_cmd == "dance") client.Dance1();
-            else if (voice_cmd == "flip") client.FrontFlip();
-            else if (voice_cmd == "jump") client.FrontJump();
-            return;
-        }
-
-        else if (voice_cmd == "follow") {
-            if (current_state == SITTING) {
-                std::cout << "Standing up to follow..." << std::endl;
-                performStandUp(client);
-                return;
-            }
-            std::cout << "Follow mode enabled" << std::endl;
-        }
-        else if (voice_cmd == "stop") {
-            std::cout << "Stop command" << std::endl;
-            if (is_spinning.load()) {
-                stopContinuousSpin(client);
-                return;
-            }
-            client.Move(0, 0, 0);
-            if (current_state == FOLLOWING) {
-                current_robot_physical_state.store(IDLE_STANDING);
-            }
-        }
-    }
-
     if (is_action_in_progress.load()) {
-        std::cout << "Robot: Action in progress (" << current_robot_state_string_global << "), waiting..." << std::endl;
-        client.Move(0,0,0);
+        client.Move(0, 0, 0);
         return;
     }
 
-    bool person_detected_in_frame = false;
-    if (!detections.empty()) {
-        person_detected_in_frame = true;
-        if (tracked_person_id == -1) {
-            std::sort(detections.begin(), detections.end(), [](const PoseDetection& a, const PoseDetection& b) {
-                return a.box.area() > b.box.area();
-            });
-            current_tracked_person_det = &detections[0];
-            tracked_person_id = std::chrono::high_resolution_clock::now().time_since_epoch().count();
-            last_tracked_person_box = current_tracked_person_det->box;
-            current_tracked_person_det->tracking_id = tracked_person_id;
-            std::cout << "Started tracking new person with ID: " << tracked_person_id << std::endl;
-            current_person_follow_status_global = "Tracking ID: " + std::to_string(tracked_person_id);
-            frames_person_standing_still = 0;
-            frames_person_too_close = 0;
-        } else {
-            float max_iou = 0.f;
-            PoseDetection* best_match_det = nullptr;
-            for (auto& det : detections) {
-                float iou = calculateIoU(last_tracked_person_box, det.box);
-                if (iou > max_iou && iou > 0.3f) {
-                    max_iou = iou;
-                    best_match_det = &det;
-                }
-            }
-            if (best_match_det) {
-                current_tracked_person_det = best_match_det;
-                last_tracked_person_box = current_tracked_person_det->box;
-                current_tracked_person_det->tracking_id = tracked_person_id;
-                current_person_follow_status_global = "Tracking ID: " + std::to_string(tracked_person_id);
-            } else {
-                current_tracked_person_det = nullptr;
-                std::cout << "Tracked person (ID: " << tracked_person_id << ") lost." << std::endl;
-            }
-        }
-    } else {
-        current_tracked_person_det = nullptr;
-    }
-    tracked_person_id_global = tracked_person_id;
-
-    std::string desired_high_level_vision_state = "stop";
-
-    if (current_tracked_person_det) {
-        float normalized_person_height = static_cast<float>(current_tracked_person_det->box.height) / image_height;
-        float normalized_person_center_x = (static_cast<float>(current_tracked_person_det->box.x) + current_tracked_person_det->box.width / 2.0f) / image_width;
-
-        bool person_is_still = false;
-        if (last_person_center_check.x != -1) {
-            float dx = (current_tracked_person_det->box.x + current_tracked_person_det->box.width/2.0f) - last_person_center_check.x;
-            float dy = (current_tracked_person_det->box.y + current_tracked_person_det->box.height/2.0f) - last_person_center_check.y;
-            float d_area_ratio = std::abs(current_tracked_person_det->box.area() - last_person_area_check) / last_person_area_check;
-
-            if (std::abs(dx) < 5.0f && std::abs(dy) < 5.0f && d_area_ratio < 0.05f) {
-                person_is_still = true;
-            }
-        }
-
-        last_person_center_check = cv::Point2f(current_tracked_person_det->box.x + current_tracked_person_det->box.width / 2.0f,
-                                               current_tracked_person_det->box.y + current_tracked_person_det->box.height / 2.0f);
-        last_person_area_check = static_cast<float>(current_tracked_person_det->box.area());
-
-        if (current_robot_physical_state.load() == SITTING) {
-            desired_high_level_vision_state = "follow";
-            frames_person_too_close = 0;
-            frames_person_standing_still = 0;
-        } else if (normalized_person_height > PERSON_VERY_CLOSE_HEIGHT_RATIO) {
-            desired_high_level_vision_state = "very_close_stop";
-            frames_person_standing_still = 0;
-            frames_person_too_close++;
-        } else if (person_is_still && normalized_person_height > PERSON_FAR_HEIGHT_RATIO) {
-            frames_person_standing_still++;
-            if (frames_person_standing_still >= SIT_ON_STILL_DELAY_FRAMES) {
-                desired_high_level_vision_state = "sit";
-            } else {
-                desired_high_level_vision_state = "stop";
-            }
-            frames_person_too_close = 0;
-        } else if (normalized_person_height < PERSON_LOST_HEIGHT_RATIO) {
-            desired_high_level_vision_state = "follow";
-            frames_person_standing_still = 0;
-            frames_person_too_close = 0;
-        } else {
-            desired_high_level_vision_state = "follow";
-            frames_person_standing_still = 0;
-            frames_person_too_close = 0;
-        }
-    } else {
-        frames_person_standing_still = 0;
-        frames_person_too_close = 0;
-
-        if (tracked_person_id != -1 && current_robot_physical_state.load() != SITTING) {
-            frames_person_lost++;
-
-            // Wait for delay before sitting
-            if (frames_person_lost >= LOST_PERSON_SIT_DELAY_FRAMES) {
-                std::cout << "Person lost for " << (LOST_PERSON_SIT_DELAY_FRAMES / FRAME_RATE)
-                          << " second(s), sitting down." << std::endl;
-                tracked_person_id = -1;
-                current_person_follow_status_global = "Person Lost. Sitting down.";
-                performSit(client);
-                frames_person_lost = 0;
-                return;
-            } else {
-                // Still waiting, show countdown
-                std::cout << "Person lost (" << frames_person_lost << "/"
-                          << LOST_PERSON_SIT_DELAY_FRAMES << " frames). Waiting..." << std::endl;
-                client.Move(0.f, 0.f, 0.f);  // Stop moving while waiting
-                current_person_follow_status_global = "Person Lost - Waiting " +
-                    std::to_string(LOST_PERSON_SIT_DELAY_FRAMES - frames_person_lost) + " frames...";
-                desired_high_level_vision_state = "stop";
-            }
-        } else {
-            // Reset counter when person is present or already sitting
-            frames_person_lost = 0;
-            desired_high_level_vision_state = "stop";
-            current_person_follow_status_global = "Not Detected / Idle";
-        }
+    if (locked_person_id == -1) {
+        current_person_follow_status_global = "No lock. Press 'L'";
+        current_robot_physical_state.store(IDLE_STANDING);
+        client.StopMove();
+        frames_locked_person_missing = 0;
+        search_rotation_frames = 0;
+        last_known_person_center_x = 0.5f;
+        return;
     }
 
-    float command_vx = 0.f;
-    float command_vyaw = 0.f;
-    RobotState physical_state = current_robot_physical_state.load();
-
-    if (physical_state == IDLE_STANDING) {
-        if (desired_high_level_vision_state == "follow") {
-            current_robot_physical_state.store(FOLLOWING);
-        } else if (desired_high_level_vision_state == "very_close_stop") {
-            std::cout << "Stopping - person very close, waiting to sit" << std::endl;
-            client.Move(0.f, 0.f, 0.f);
-            current_robot_physical_state.store(STOPPING_FOR_STILL_PERSON);
-        } else if (desired_high_level_vision_state == "sit") {
-            performSit(client);
-        } else if (desired_high_level_vision_state == "stop") {
-            client.Move(0.f, 0.f, 0.f);
-        } else if (desired_high_level_vision_state == "lost_person_sit") {
-            performSit(client);
-        }
-    }
-    else if (physical_state == FOLLOWING) {
-        if (desired_high_level_vision_state == "follow" && current_tracked_person_det != nullptr) {
-            float normalized_person_height = static_cast<float>(current_tracked_person_det->box.height) / image_height;
-            float normalized_person_center_x = (static_cast<float>(current_tracked_person_det->box.x) + current_tracked_person_det->box.width/2.0f) / image_width;
-
-            command_vx = MIN_FOLLOW_SPEED_X + (MAX_FOLLOW_SPEED_X - MIN_FOLLOW_SPEED_X) *
-                         ((PERSON_CLOSE_HEIGHT_RATIO - normalized_person_height) / (PERSON_CLOSE_HEIGHT_RATIO - PERSON_FAR_HEIGHT_RATIO));
-            command_vx = std::max(MIN_FOLLOW_SPEED_X, std::min(MAX_FOLLOW_SPEED_X, command_vx));
-
-            int speed_level = 1;
-            if (normalized_person_height < PERSON_FAR_HEIGHT_RATIO) speed_level = 2;
-            else if (normalized_person_height < PERSON_MEDIUM_HEIGHT_RATIO) speed_level = 1;
-            else speed_level = 0;
-            client.SpeedLevel(speed_level);
-
-            if (normalized_person_center_x < 0.5f - HORIZONTAL_CENTER_TOLERANCE)
-                command_vyaw = TURN_SPEED_YAW;
-            else if (normalized_person_center_x > 0.5f + HORIZONTAL_CENTER_TOLERANCE)
-                command_vyaw = -TURN_SPEED_YAW;
-            else
-                command_vyaw = 0.f;
-
-            std::string move_dir = (command_vyaw > 0) ? "left" : (command_vyaw < 0) ? "right" : "straight";
-            std::cout << "Following: Vx=" << command_vx << ", Vyaw=" << command_vyaw << ", MoveDir=" << move_dir << ", SpeedLevel=" << speed_level << std::endl;
-            client.Move(command_vx, 0.f, command_vyaw);
-        } else if (desired_high_level_vision_state == "very_close_stop") {
-            std::cout << "Person too close while following, stopping..." << std::endl;
-            client.Move(0.f, 0.f, 0.f);
-            current_robot_physical_state.store(STOPPING_FOR_STILL_PERSON);
-        } else if (desired_high_level_vision_state == "stop") {
-            std::cout << "Person stopped, robot stopping movement but staying in FOLLOWING" << std::endl;
-            client.Move(0.f, 0.f, 0.f);
-            current_robot_physical_state.store(STOPPING_FOR_STILL_PERSON);
-        } else {
-            std::cout << "Leaving FOLLOWING state to IDLE" << std::endl;
-            client.Move(0.f, 0.f, 0.f);
-            current_robot_physical_state.store(IDLE_STANDING);
-        }
-    }
-    else if (physical_state == SITTING) {
-        client.Move(0.f, 0.f, 0.f);
-
-        // Optional: Show hint
-        static auto last_hint_time = std::chrono::steady_clock::now();
-        auto now = std::chrono::steady_clock::now();
-        if (std::chrono::duration_cast<std::chrono::seconds>(now - last_hint_time).count() > 10) {
-            if (current_tracked_person_det != nullptr) {
-                std::cout << "Robot sitting. Hold 'V' and say 'robot stand' to wake" << std::endl;
-            }
-            last_hint_time = now;
-        }
-    }
-    else if (physical_state == STOPPING_FOR_STILL_PERSON) {
-        static int frames_person_lost = 0;
-
-        if (current_tracked_person_det == nullptr) {
-            // Person lost while in stopping state
-            frames_person_lost++;
-
-            if (frames_person_lost >= LOST_PERSON_SIT_DELAY_FRAMES) {
-                std::cout << "Person lost for " << (LOST_PERSON_SIT_DELAY_FRAMES / FRAME_RATE) << " seconds, sitting down." << std::endl;
-                tracked_person_id = -1;
-                current_person_follow_status_global = "Person Lost. Sitting down.";
-                performSit(client);
-                frames_person_lost = 0;
-            } else {
-                std::cout << "Person temporarily lost (" << frames_person_lost << "/" << LOST_PERSON_SIT_DELAY_FRAMES << " frames)..." << std::endl;
-                client.Move(0.f, 0.f, 0.f);
-                current_person_follow_status_global = "Person Temporarily Lost - Waiting...";
-            }
-        } else {
-            // Person re-detected or still present
-            frames_person_lost = 0;
-
-            if (desired_high_level_vision_state == "sit" || desired_high_level_vision_state == "very_close_stop") {
-                if (frames_person_too_close >= SIT_ON_CLOSE_DELAY_FRAMES || frames_person_standing_still >= SIT_ON_STILL_DELAY_FRAMES) {
-                    performSit(client);
-                } else {
-                    std::cout << "Waiting to sit due to close or still person..." << std::endl;
-                    client.Move(0.f, 0.f, 0.f);
-                }
-            } else if (desired_high_level_vision_state == "follow") {
-                std::cout << "Person moved, resuming following..." << std::endl;
-                frames_person_standing_still = 0;
-                frames_person_too_close = 0;
+    // Try to find the LOCKED person specifically
+    current_tracked_person = reid_tracker.findTrackById(locked_person_id);
+    
+    // Check if locked person exists and is visible
+    bool locked_person_visible = false;
+    
+    if (current_tracked_person) {
+        // Person track exists - check if actually visible (not just predicted)
+        if (current_tracked_person->time_since_update == 0) {
+            // Person was detected this frame - check if bbox is mostly in frame
+            cv::Rect frame_rect(0, 0, image_width, image_height);
+            cv::Rect intersection = current_tracked_person->bbox & frame_rect;
+            float visibility_ratio = static_cast<float>(intersection.area()) / current_tracked_person->bbox.area();
+            
+            if (visibility_ratio > 0.5f) {
+                // Locked person is clearly visible
+                locked_person_visible = true;
+                frames_locked_person_missing = 0;
+                search_rotation_frames = 0;
+                tracked_person_id_global = current_tracked_person->id;
+                
+                // Store last known position
+                last_known_person_center_x = (current_tracked_person->bbox.x + current_tracked_person->bbox.width/2.0f) / image_width;
+                
+                current_person_follow_status_global = "LOCKED & VISIBLE ID:" + std::to_string(locked_person_id);
                 current_robot_physical_state.store(FOLLOWING);
             } else {
-                std::cout << "Person moved or lost, going to IDLE..." << std::endl;
-                client.Move(0.f, 0.f, 0.f);
-                current_robot_physical_state.store(IDLE_STANDING);
+                // Person detected but mostly out of frame - consider as missing
+                locked_person_visible = false;
+                frames_locked_person_missing++;
+                current_person_follow_status_global = "Locked person at edge of frame...";
+                current_robot_physical_state.store(LOST_PERSON_IDLE);
+            }
+        } else {
+            // Person track exists but is being predicted (not actually detected)
+            locked_person_visible = false;
+            frames_locked_person_missing++;
+            current_person_follow_status_global = "Locked person not detected (predicting)...";
+            current_robot_physical_state.store(LOST_PERSON_IDLE);
+        }
+    } else {
+        // Locked person track doesn't exist at all
+        locked_person_visible = false;
+        frames_locked_person_missing++;
+        tracked_person_id_global = -1;
+        current_robot_physical_state.store(LOST_PERSON_IDLE);
+    }
+    
+    // If locked person is NOT visible, initiate search sequence
+    if (!locked_person_visible) {
+        const int SEARCH_DELAY = 10;  // Changed from 2 * FRAME_RATE to 10 frames
+        const int SEARCH_ROTATION_FRAMES = 10 * FRAME_RATE;  // 10 seconds of rotation
+        
+        if (frames_locked_person_missing < SEARCH_DELAY) {
+            // Initial wait period - person just disappeared
+            current_person_follow_status_global = "Locked person lost. Waiting... (" + 
+                std::to_string(frames_locked_person_missing) + "/" + std::to_string(SEARCH_DELAY) + ")";
+            client.StopMove();
+            search_rotation_frames = 0;
+        } else if (search_rotation_frames < SEARCH_ROTATION_FRAMES) {
+            // Actively searching - rotate to find locked person
+            int search_progress = (search_rotation_frames * 100) / SEARCH_ROTATION_FRAMES;
+            current_person_follow_status_global = "Searching for locked person ID:" + 
+                std::to_string(locked_person_id) + " (" + std::to_string(search_progress) + "%)";
+            
+            // Rotate in the direction where person was last seen
+            // If person was on left side (< 0.5), rotate left (positive yaw)
+            // If person was on right side (> 0.5), rotate right (negative yaw)
+            float search_yaw = (last_known_person_center_x < 0.5f) ? 0.6f : -0.6f;
+            g_last_yaw_command.store(search_yaw);
+            client.Move(0, 0, search_yaw);
+            search_rotation_frames++;
+            current_robot_physical_state.store(SPINNING);
+        } else {
+            // Search complete - locked person not found after full rotation
+            current_person_follow_status_global = "Locked person not found. Sitting down...";
+            std::cout << "Locked person (ID: " << locked_person_id << ") not found after full rotation. Sitting down." << std::endl;
+            
+            performSit(client, false);
+            locked_person_id = -1;
+            reid_tracker.setLockedTrackId(-1);
+            frames_locked_person_missing = 0;
+            search_rotation_frames = 0;
+            last_known_person_center_x = 0.5f;
+            waiting_for_trigger = true;
+        }
+        return;
+    }
+    
+    // Locked person IS visible - follow them
+    if (current_tracked_person && locked_person_visible) {
+        float norm_height = static_cast<float>(current_tracked_person->bbox.height) / image_height;
+        float norm_center_x = (current_tracked_person->bbox.x + current_tracked_person->bbox.width/2.0f) / image_width;
+        
+        // Compute forward speed based on person's distance (height in frame)
+        float speed_factor = (PERSON_CLOSE_HEIGHT_RATIO - norm_height) / 
+                            (PERSON_CLOSE_HEIGHT_RATIO - PERSON_FAR_HEIGHT_RATIO);
+        speed_factor = std::max(0.0f, std::min(1.0f, speed_factor));
+        
+        float command_vx = MIN_FOLLOW_SPEED_X + (MAX_FOLLOW_SPEED_X - MIN_FOLLOW_SPEED_X) * speed_factor;
+        float command_vyaw = 0.0f;
+        
+        // Compute turning based on horizontal position
+        if (norm_center_x < 0.5f - HORIZONTAL_CENTER_TOLERANCE) {
+            command_vyaw = TURN_SPEED_YAW;  // Turn left
+        } else if (norm_center_x > 0.5f + HORIZONTAL_CENTER_TOLERANCE) {
+            command_vyaw = -TURN_SPEED_YAW;  // Turn right
+        }
+        
+        // If turning a lot, reduce forward speed
+        if (std::abs(command_vyaw) > 0.5f && std::abs(norm_center_x - 0.5f) > 0.25f) {
+            command_vx *= 0.3f;  // Slow down when turning
+        }
+        
+        // Stop if person is too close
+        if (norm_height > PERSON_CLOSE_HEIGHT_RATIO) {
+            command_vx = 0.0f;
+            current_person_follow_status_global = "Locked person too close. Stopped.";
+            current_robot_physical_state.store(STOPPING_FOR_STILL_PERSON);
+        }
+        
+        // Stop if person is too far
+        if (norm_height < PERSON_FAR_HEIGHT_RATIO) {
+            command_vx = 0.0f;
+            current_person_follow_status_global = "Locked person too far. Stopped.";
+            current_robot_physical_state.store(STOPPING_FOR_STILL_PERSON);
+        }
+        
+        g_last_yaw_command.store(command_vyaw);
+        
+        // Send command continuously
+        long long now = now_ns();
+        if (now - last_command_time > 30000000) {  // Send at ~30Hz
+            client.Move(command_vx, 0, command_vyaw);
+            last_command_time = now;
+            
+            // Debug output
+            if (command_vx != 0.0f || command_vyaw != 0.0f) {
+                std::cout << "Following ID:" << locked_person_id 
+                         << " vx=" << command_vx << " vyaw=" << command_vyaw 
+                         << " (person at " << (norm_center_x * 100) << "% width, " 
+                         << (norm_height * 100) << "% height)" << std::endl;
             }
         }
+    } else {
+        // Safety fallback - stop if something went wrong
+        client.StopMove();
     }
 }
 
-int main(int argc, char** argv) {
-    if (argc < 2) {
-        std::cerr << "Usage: " << argv[0] << " <network_interface_name>" << std::endl;
-        return 1;
+void sigint_handler(int sig) {
+    std::cout << "\nCtrl+C detected. Generating report..." << std::endl;
+    metrics_finalize();
+    _exit(0);
+}
+
+// --- YOLO Detection ---
+struct Detection {
+    int class_id;
+    float confidence;
+    cv::Rect box;
+};
+
+class YOLODetector {
+public:
+    YOLODetector(const std::string& model_path) {
+        net = cv::dnn::readNetFromONNX(model_path);
+        if (net.empty()) {
+            std::cerr << "ERROR: Could not load YOLO model." << std::endl;
+            exit(1);
+        }
+        net.setPreferableBackend(cv::dnn::DNN_BACKEND_OPENCV);
+        net.setPreferableTarget(cv::dnn::DNN_TARGET_CPU);
     }
 
+    std::vector<Detection> detect(const cv::Mat& frame) {
+        std::vector<Detection> detections;
+        if (frame.empty()) return detections;
+        
+        cv::Mat blob;
+        cv::dnn::blobFromImage(frame, blob, 1/255.0, cv::Size(640, 640), cv::Scalar(), true, false);
+        net.setInput(blob);
+        
+        std::vector<cv::Mat> outputs;
+        net.forward(outputs, net.getUnconnectedOutLayersNames());
+        
+        cv::Mat output = outputs[0].reshape(1, outputs[0].size[1]).t();
+        
+        std::vector<cv::Rect> boxes;
+        std::vector<float> confidences;
+        
+        for (int i = 0; i < output.rows; i++) {
+            float* data = (float*)output.row(i).data;
+            float conf = data[4];
+            
+            if (conf >= 0.6f) {
+                float x = data[0] * frame.cols / 640.0f;
+                float y = data[1] * frame.rows / 640.0f;
+                float w = data[2] * frame.cols / 640.0f;
+                float h = data[3] * frame.rows / 640.0f;
+                
+                boxes.push_back(cv::Rect(x - w/2, y - h/2, w, h));
+                confidences.push_back(conf);
+            }
+        }
+        
+        std::vector<int> indices;
+        cv::dnn::NMSBoxes(boxes, confidences, 0.6f, 0.45f, indices);
+        
+        for (int idx : indices) {
+            detections.push_back({0, confidences[idx], boxes[idx]});
+        }
+        
+        return detections;
+    }
+
+private:
+    cv::dnn::Net net;
+};
+
+// --- Main ---
+int main(int argc, char** argv) {
+    if (argc < 2) {
+        std::cerr << "Usage: " << argv[0] << " <network_interface>" << std::endl;
+        return 1;
+    }
+    
     signal(SIGINT, sigint_handler);
-
+    
     unitree::robot::ChannelFactory::Instance()->Init(0, std::string(argv[1]));
-
     unitree::robot::go2::SportClient sport_client;
     sport_client.SetTimeout(10.0f);
     sport_client.Init();
     sport_client_ptr = &sport_client;
-
+    
     unitree::robot::go2::VideoClient video_client;
     video_client.SetTimeout(1.0f);
     video_client.Init();
-
+    
     std::string model_dir = "/home/slam22/unitree_ws/src/unitree_sdk2/assets/models/yolov8/";
-    YoloPoseDetector yolo_detector(model_dir + "yolo11n-pose.onnx", model_dir + "pose.names");
-
-    // Initialize audio detector
-    audio_detector = std::make_unique<AudioDetector>();
-    audio_detector->start();
-
-    std::cout << "\nInitializing robot..." << std::endl;
-    std::cout << "Make sure the robot has enough space and is on a flat surface!" << std::endl;
-    std::cout << "   Press Enter to make the robot stand up, or Ctrl+C to cancel..." << std::endl;
-    std::cin.ignore();
-
-    std::cout << "Commanding robot to stand up..." << std::endl;
-    sport_client.StandUp();
-
-    // Wait for stand up to complete
-    std::cout << "   Waiting for robot to stand (3 seconds)..." << std::endl;
-    std::this_thread::sleep_for(std::chrono::milliseconds(3000));
-
-    current_robot_physical_state.store(IDLE_STANDING);
-    std::cout << "Robot is standing and ready!" << std::endl;
-
-    cv::namedWindow("Robot Camera Feed", cv::WINDOW_AUTOSIZE);
-
-    std::cout << "\n----------------------------------------------------" << std::endl;
-    std::cout << "Robot Control (YOLO-Pose Following + Push-to-Talk Voice)" << std::endl;
-    std::cout << "Push-to-Talk: HOLD 'V' then say 'robot <command>'" << std::endl;
-    std::cout << "    Movement: 'robot follow me', 'robot stop', 'robot sit', 'robot stand'" << std::endl;
-    std::cout << "    Rotation: 'robot turn around', 'robot spin'" << std::endl;
-    std::cout << "    Poses: 'robot damp', 'robot balance', 'robot recovery'" << std::endl;
-    std::cout << "    Actions: 'robot hello', 'robot stretch', 'robot dance'" << std::endl;
-    std::cout << "    Tricks: 'robot flip', 'robot jump'" << std::endl;
-    std::cout << "Keyboard: 'm' = manual mode, WASD/QE = move" << std::endl;
-    std::cout << "Vision: Auto-follows detected people when standing" << std::endl;
-    std::cout << "Press Ctrl+C or ESC to stop." << std::endl;
-    std::cout << "----------------------------------------------------\n" << std::endl;
-
-    bool manual_control_mode = false;
-
+    
+    std::ifstream yolo_check(model_dir + "yolo11n-pose.onnx");
+    if (!yolo_check.good()) {
+        std::cerr << "ERROR: YOLO model not found!" << std::endl;
+        std::cerr << "Expected: " << model_dir << "yolo11n-pose.onnx" << std::endl;
+        std::cerr << "\nDownload with:" << std::endl;
+        std::cerr << "  cd " << model_dir << std::endl;
+        std::cerr << "  wget https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo11n.onnx" << std::endl;
+        return 1;
+    }
+    
+    YOLODetector yolo_detector(model_dir + "yolo11n-pose.onnx");
+    ReIDExtractor reid_extractor(model_dir + "osnet_x1_0.onnx");
+    
+    g_metrics.start_time_ns = now_ns();
+    
+    std::cout << "\nRobot will start in SITTING position." << std::endl;
+    std::cout << "Wave your hand in front of the upward-facing camera to trigger stand-up." << std::endl;
+    
+    sport_client.Sit();
+    std::this_thread::sleep_for(std::chrono::milliseconds(2000));
+    current_robot_physical_state.store(SITTING);
+    waiting_for_trigger = true;
+    
+    cv::namedWindow("Robot Feed", cv::WINDOW_AUTOSIZE);
+    std::cout << "\n========== CONTROLS (Focus on video window!) ==========\n"
+              << "TRACKING:\n"
+              << "  L: Lock onto largest person\n"
+              << "  U: Unlock\n"
+              << "  R: Reset tracker\n"
+              << "  M: Toggle Manual Control Mode\n"
+              << "\nMANUAL CONTROL (when enabled):\n"
+              << "  W: Forward\n"
+              << "  S: Backward\n"
+              << "  A: Rotate Left\n"
+              << "  D: Rotate Right\n"
+              << "  Space: Stop\n"
+              << "\nOTHER:\n"
+              << "  J: Manual sit/stand toggle\n"
+              << "  ESC: Exit\n"
+              << "=======================================================\n" << std::endl;
+    
+    int trigger_detection_frames = 0;
+    const int TRIGGER_CONFIRMATION_FRAMES = 15;
+    
     while (running.load()) {
         std::vector<uint8_t> image_data;
-        int ret = video_client.GetImageSample(image_data);
-
-        if (ret == 0 && !image_data.empty()) {
-            cv::Mat raw_image = cv::imdecode(image_data, cv::IMREAD_COLOR);
-            if (!raw_image.empty()) {
-                std::vector<PoseDetection> detections = yolo_detector.detect(raw_image);
-
-                std::vector<PoseDetection> filtered_detections;
-                const auto& class_names = yolo_detector.getClassNames();
+        if (video_client.GetImageSample(image_data) == 0 && !image_data.empty()) {
+            cv::Mat frame = cv::imdecode(image_data, cv::IMREAD_COLOR);
+            if (!frame.empty()) {
+                g_metrics.total_frames++;
+                
+                long long t0 = now_ns();
+                auto detections = yolo_detector.detect(frame);
+                metrics_record_yolo(now_ns() - t0);
+                
+                std::vector<cv::Rect> boxes;
+                std::vector<cv::Mat> embeddings;
+                std::vector<float> scores;
+                
+                t0 = now_ns();
                 for (const auto& det : detections) {
-                    if (det.class_id < class_names.size() && class_names[det.class_id] == "person") {
-                        filtered_detections.push_back(det);
-                    }
+                    boxes.push_back(det.box);
+                    embeddings.push_back(reid_extractor.extract(frame, det.box));
+                    scores.push_back(det.confidence);
                 }
-
-                const std::string instructions = "Hold 'V' to talk. Press 'm' for manual. WASD/QE = move/turn.";
-                cv::putText(raw_image, instructions, cv::Point(10, raw_image.rows - 20),
-                            cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(255,255,255), 1);
-                if (manual_control_mode) {
-                    cv::putText(raw_image, "MANUAL CONTROL ACTIVE", cv::Point(10, 25),
-                                cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(0,0,255), 2);
-                }
-                if (push_to_talk_active.load()) {
-                    cv::putText(raw_image, "LISTENING... (Release 'V' when done)", cv::Point(10, raw_image.rows - 50),
-                                cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0,255,0), 2);
-                }
-
-                if (manual_control_mode) {
-                    cv::putText(raw_image, "MANUAL CONTROL ACTIVE", cv::Point(10, 25),
-                                cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(0,0,255), 2);
-                }
-                int key = cv::waitKey(1);
-                if (key == 'v' || key == 'V') {
-                    if (!push_to_talk_active.load()) {
-                        push_to_talk_active.store(true);
-                        std::cout << "\nPUSH-TO-TALK ACTIVATED - Listening for 'robot' command..." << std::endl;
-                    }
-                } else if (push_to_talk_active.load() && key != -1) {
-                    // Any other key releases push-to-talk
-                    push_to_talk_active.store(false);
-                    std::cout << "Push-to-talk released" << std::endl;
-                }
-
-                if (key == 27) {
-                    std::cout << "\nESC pressed. Exiting..." << std::endl;
-                    break;
-                } else if (key == 'm' || key == 'M') {
-                    manual_control_mode = !manual_control_mode;
-                    std::cout << "Manual control mode toggled to " << (manual_control_mode ? "ON" : "OFF") << std::endl;
-                    if (!manual_control_mode) {
-                        sport_client.Move(0,0,0);
-                        is_action_in_progress.store(false);
-                        current_robot_physical_state.store(IDLE_STANDING);
-                    }
-                }
-
-                if (manual_control_mode) {
-                    float vx = 0.f;
-                    float vyaw = 0.f;
-
-                    if (key == 'w' || key == 'W') vx = MANUAL_MOVE_SPEED;
-                    else if (key == 's' || key == 'S') vx = -MANUAL_MOVE_SPEED;
-
-                    if (key == 'a' || key == 'A' || key == 'q' || key == 'Q') vyaw = MANUAL_TURN_SPEED;
-                    else if (key == 'd' || key == 'D' || key == 'e' || key == 'E') vyaw = -MANUAL_TURN_SPEED;
-
-                    if (vx != 0.f || vyaw != 0.f) {
-                        is_action_in_progress.store(false);
-                        current_robot_physical_state.store(IDLE_STANDING);
-                        sport_client.Move(vx, 0.f, vyaw);
-                    } else {
-                        sport_client.Move(0.f, 0.f, 0.f);
-                    }
-                } else {
-                    sendRobotCommand(sport_client, filtered_detections, raw_image.cols, raw_image.rows);
-                }
-
-                for (const auto& det : filtered_detections) {
-                    cv::Scalar box_color = (det.tracking_id != -1 && det.tracking_id == tracked_person_id_global) ? cv::Scalar(255,0,0) : cv::Scalar(0,255,0);
-
-                    cv::rectangle(raw_image, det.box, box_color, 2);
-                    std::string label = class_names[det.class_id] + ": " + std::to_string(det.confidence).substr(0,4);
-                    if (det.tracking_id != -1) label += " (ID:" + std::to_string(det.tracking_id) + ")";
-                    cv::putText(raw_image, label, cv::Point(det.box.x, det.box.y-10),
-                                cv::FONT_HERSHEY_SIMPLEX, 0.7, box_color, 2);
-
-                    for (size_t i = 0; i < det.keypoints.size(); ++i) {
-                        if (det.kp_scores[i] > 0.3f) {
-                            cv::circle(raw_image, det.keypoints[i], 3, cv::Scalar(0,0,255), -1);
+                metrics_record_reid(now_ns() - t0);
+                
+                t0 = now_ns();
+                reid_tracker.update(boxes, embeddings, scores);
+                metrics_record_tracker(now_ns() - t0);
+                
+                // Trigger detection logic
+                if (waiting_for_trigger && current_robot_physical_state.load() == SITTING) {
+                    if (!boxes.empty()) {
+                        trigger_detection_frames++;
+                        current_person_follow_status_global = "Person detected! Hold position... (" + 
+                            std::to_string(trigger_detection_frames) + "/" + 
+                            std::to_string(TRIGGER_CONFIRMATION_FRAMES) + ")";
+                        
+                        if (trigger_detection_frames >= TRIGGER_CONFIRMATION_FRAMES) {
+                            std::cout << "Trigger confirmed! Standing up..." << std::endl;
+                            performStandUp(sport_client);
+                            waiting_for_trigger = false;
+                            trigger_detection_frames = 0;
+                            current_person_follow_status_global = "Standing up. Press 'L' to lock.";
                         }
+                    } else {
+                        trigger_detection_frames = 0;
+                        current_person_follow_status_global = "Waiting for trigger... Wave in front of camera.";
                     }
                 }
-
-                cv::putText(raw_image, "Robot State: " + current_robot_state_string_global, cv::Point(10,30),
-                            cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(255,255,0), 2, cv::LINE_AA);
-                cv::putText(raw_image, "Person Status: " + current_person_follow_status_global, cv::Point(10,60),
-                            cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(255,255,0), 2, cv::LINE_AA);
-
-                cv::imshow("Robot Camera Feed", raw_image);
+                
+                // Draw UI first
+                for (const auto& t : reid_tracker.getTracks()) {
+                    cv::Scalar color = (locked_person_id == t.id) ? cv::Scalar(255, 0, 0) : 
+                                      t.isConfirmed() ? cv::Scalar(0, 255, 0) : cv::Scalar(0, 255, 255);
+                    int thick = (locked_person_id == t.id) ? 3 : 2;
+                    cv::rectangle(frame, t.bbox, color, thick);
+                    
+                    std::string label = "ID:" + std::to_string(t.id);
+                    if (locked_person_id == t.id) label = "LOCKED " + label;
+                    
+                    cv::putText(frame, label, 
+                               cv::Point(t.bbox.x, t.bbox.y - 10), 
+                               cv::FONT_HERSHEY_SIMPLEX, 0.6, color, 2);
+                }
+                
+                // Status overlay
+                cv::Scalar status_color = waiting_for_trigger ? cv::Scalar(0, 165, 255) : 
+                                         manual_control_active.load() ? cv::Scalar(255, 165, 0) :
+                                         cv::Scalar(0, 255, 255);
+                
+                cv::putText(frame, "State: " + current_robot_state_string_global, 
+                           cv::Point(10, 30), cv::FONT_HERSHEY_SIMPLEX, 0.7, status_color, 2);
+                cv::putText(frame, current_person_follow_status_global, 
+                           cv::Point(10, 60), cv::FONT_HERSHEY_SIMPLEX, 0.7, status_color, 2);
+                
+                if (manual_control_active.load()) {
+                    cv::putText(frame, "MANUAL CONTROL: W/A/S/D + Space", 
+                               cv::Point(frame.cols/2 - 200, frame.rows - 30), 
+                               cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(255, 165, 0), 2);
+                    
+                    // Show current command
+                    std::string cmd_text = "Cmd: ";
+                    if (manual_moving) {
+                        if (manual_vx > 0) cmd_text += "FWD";
+                        else if (manual_vx < 0) cmd_text += "BACK";
+                        if (manual_vyaw > 0) cmd_text += " LEFT";
+                        else if (manual_vyaw < 0) cmd_text += " RIGHT";
+                    } else {
+                        cmd_text += "STOPPED";
+                    }
+                    cv::putText(frame, cmd_text, 
+                               cv::Point(10, 90), cv::FONT_HERSHEY_SIMPLEX, 0.6, 
+                               cv::Scalar(255, 165, 0), 2);
+                } else if (waiting_for_trigger) {
+                    cv::putText(frame, "WAITING FOR TRIGGER", 
+                               cv::Point(frame.cols/2 - 150, frame.rows - 30), 
+                               cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(0, 165, 255), 2);
+                }
+                
+                cv::imshow("Robot Feed", frame);
+                
+                // Process keyboard from OpenCV window
+                int key = cv::waitKey(1) & 0xFF;
+                
+                if (key == 27) { // ESC
+                    break;
+                } else if (key == 'l' || key == 'L') {
+                    if (current_robot_physical_state.load() == IDLE_STANDING || 
+                        current_robot_physical_state.load() == FOLLOWING) {
+                        Track* best = nullptr;
+                        float max_area = 0;
+                        for (auto& t : reid_tracker.getTracks()) {
+                            if (t.isConfirmed() && t.time_since_update == 0 && t.bbox.area() > max_area) {
+                                max_area = t.bbox.area();
+                                best = &t;
+                            }
+                        }
+                        if (best) {
+                            locked_person_id = best->id;
+                            reid_tracker.setLockedTrackId(locked_person_id);
+                            manual_control_active.store(false);
+                            manual_moving = false;
+                            sport_client.StopMove();
+                            std::cout << "Locked ID: " << locked_person_id << " (Manual control disabled)" << std::endl;
+                        } else {
+                            std::cout << "No confirmed person to lock onto." << std::endl;
+                        }
+                    } else {
+                        std::cout << "Robot must be standing to lock." << std::endl;
+                    }
+                } else if (key == 'u' || key == 'U') {
+                    locked_person_id = -1;
+                    reid_tracker.setLockedTrackId(-1);
+                    sport_client.StopMove();
+                    std::cout << "Unlocked." << std::endl;
+                } else if (key == 'r' || key == 'R') {
+                    locked_person_id = -1;
+                    reid_tracker = ReIDTracker();
+                    sport_client.StopMove();
+                    std::cout << "Tracker reset." << std::endl;
+                } else if (key == 'm' || key == 'M') {
+                    bool current_mode = manual_control_active.load();
+                    manual_control_active.store(!current_mode);
+                    if (!current_mode) {
+                        locked_person_id = -1;
+                        reid_tracker.setLockedTrackId(-1);
+                        sport_client.StopMove();
+                        manual_moving = false;
+                        std::cout << "MANUAL CONTROL MODE ENABLED (Use WASD + Space on video window)" << std::endl;
+                        current_person_follow_status_global = "MANUAL CONTROL MODE";
+                    } else {
+                        sport_client.StopMove();
+                        manual_moving = false;
+                        std::cout << "MANUAL CONTROL MODE DISABLED" << std::endl;
+                        current_person_follow_status_global = "Press 'L' to lock person";
+                    }
+                } else if (key == 'j' || key == 'J') {
+                    if (current_robot_physical_state.load() == SITTING) {
+                        performStandUp(sport_client);
+                        waiting_for_trigger = false;
+                    } else if (current_robot_physical_state.load() == IDLE_STANDING || 
+                               current_robot_physical_state.load() == FOLLOWING) {
+                        performSit(sport_client, false);
+                        locked_person_id = -1;
+                        waiting_for_trigger = true;
+                    }
+                } else if (manual_control_active.load()) {
+                    // Handle WASD in manual mode
+                    switch (key) {
+                        case 'w':
+                        case 'W':
+                            manual_vx = MANUAL_MOVE_SPEED;
+                            manual_vyaw = 0.0f;
+                            manual_moving = true;
+                            sport_client.Move(manual_vx, 0, manual_vyaw);
+                            std::cout << "Manual: Forward" << std::endl;
+                            break;
+                        case 's':
+                        case 'S':
+                            manual_vx = -MANUAL_MOVE_SPEED;
+                            manual_vyaw = 0.0f;
+                            manual_moving = true;
+                            sport_client.Move(manual_vx, 0, manual_vyaw);
+                            std::cout << "Manual: Backward" << std::endl;
+                            break;
+                        case 'a':
+                        case 'A':
+                            manual_vx = 0.0f;
+                            manual_vyaw = MANUAL_TURN_SPEED;
+                            manual_moving = true;
+                            sport_client.Move(manual_vx, 0, manual_vyaw);
+                            std::cout << "Manual: Rotate Left" << std::endl;
+                            break;
+                        case 'd':
+                        case 'D':
+                            manual_vx = 0.0f;
+                            manual_vyaw = -MANUAL_TURN_SPEED;
+                            manual_moving = true;
+                            sport_client.Move(manual_vx, 0, manual_vyaw);
+                            std::cout << "Manual: Rotate Right" << std::endl;
+                            break;
+                        case ' ':
+                            manual_vx = manual_vyaw = 0.0f;
+                            manual_moving = false;
+                            sport_client.StopMove();
+                            std::cout << "Manual: Stop" << std::endl;
+                            break;
+                    }
+                }
+                
+                // Send follow commands (unless in manual mode or waiting)
+                if (!waiting_for_trigger && current_robot_physical_state.load() != SITTING) {
+                    sendRobotCommand(sport_client, frame.cols, frame.rows);
+                }
             }
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
-
-    if (audio_detector) {
-        audio_detector->stop();
-    }
-
+    
     cv::destroyAllWindows();
-    std::cout << "Program exiting." << std::endl;
+    sport_client.StopMove();
+    metrics_finalize();
     return 0;
 }

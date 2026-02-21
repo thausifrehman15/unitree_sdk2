@@ -48,11 +48,11 @@ target_link_libraries(human_follow_control PRIVATE
     Threads::Threads
     ${CMAKE_SOURCE_DIR}/thirdparty/lib/${CMAKE_SYSTEM_PROCESSOR}/libddscxx.so
     ${CMAKE_SOURCE_DIR}/thirdparty/lib/${CMAKE_SYSTEM_PROCESSOR}/libddsc.so
-    ${ALSA_LIBRARIES}
-    ${WHISPER_BUILD_DIR}/src/libwhisper.a
-    ${WHISPER_BUILD_DIR}/ggml/src/libggml.a
-    ${WHISPER_BUILD_DIR}/ggml/src/libggml-cpu.a
-    ${WHISPER_BUILD_DIR}/ggml/src/libggml-base.a
+    # ${ALSA_LIBRARIES}  # Commented out: Audio removed
+    # ${WHISPER_BUILD_DIR}/src/libwhisper.a  # Commented out: Audio removed
+    # ${WHISPER_BUILD_DIR}/ggml/src/libggml.a  # Commented out: Audio removed
+    # ${WHISPER_BUILD_DIR}/ggml/src/libggml-cpu.a  # Commented out: Audio removed
+    # ${WHISPER_BUILD_DIR}/ggml/src/libggml-base.a  # Commented out: Audio removed
     pthread
     dl      
     m       
@@ -64,11 +64,12 @@ target_include_directories(human_follow_control PRIVATE
     ${CMAKE_SOURCE_DIR}/thirdparty/include/ddscxx
     ${CMAKE_SOURCE_DIR}/thirdparty/include
     ${OpenCV_INCLUDE_DIRS}
-    ${ALSA_INCLUDE_DIRS}
-    ${WHISPER_DIR}/include
-    ${WHISPER_DIR}/ggml/include
+    # ${ALSA_INCLUDE_DIRS}  # Commented out: Audio removed
+    # ${WHISPER_DIR}/include  # Commented out: Audio removed
+    # ${WHISPER_DIR}/ggml/include  # Commented out: Audio removed
     /usr/local/include
 )
+
 # add_executable(custom_one_leg_controller custom_one_leg_controller.cpp)
 # target_link_libraries(custom_one_leg_controller PRIVATE
 #     unitree_sdk2
